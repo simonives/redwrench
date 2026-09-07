@@ -5,6 +5,7 @@ use rmcp::{tool_handler, ServerHandler};
 use std::time::Duration;
 
 pub mod run_command;
+pub mod systemctl;
 
 #[derive(Clone)]
 pub struct RedWrenchServer {
@@ -31,7 +32,7 @@ impl RedWrenchServer {
             policy,
             timeout,
             tier_name,
-            tool_router: Self::run_command_router(),
+            tool_router: Self::run_command_router() + Self::systemctl_router(),
         }
     }
 

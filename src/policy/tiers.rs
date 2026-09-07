@@ -41,9 +41,12 @@ fn deny(command: &str, arg_pattern: &str) -> Rule {
 /// The alternation is deliberately anchored to token starts so an ordinary
 /// `ping -c 4 host` (or a hostname merely containing an `f`) is unaffected.
 /// The first alternative matches a short-option token containing `f`,
-/// including clustered forms such as `-fc`; ping's only short option using
-/// `f` is `--flood`, so there is no legitimate flag this rejects.
-const PING_ABUSE_FLAGS: &str = r"(?:^|\s)-[A-Za-z]*f[A-Za-z]*(?:\s|$)|--flood|(?:^|\s)-i\s*0*\.\d";
+/// including clustered forms with an attached value such as `-fc100`
+/// (getopt parses this as `-f -c 100`, i.e. flood ping with count 100);
+/// ping's only short option using `f` is `--flood`, so there is no
+/// legitimate flag this rejects. The interval alternative is likewise
+/// extended to clustered forms such as `-ci0.01`.
+const PING_ABUSE_FLAGS: &str = r"(?:^|\s)-[A-Za-z]*f|--flood|(?:^|\s)-[A-Za-z]*i\s*0*\.\d";
 
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
@@ -214,9 +217,14 @@ mod tests {
                 "8.8.8.8".to_string(),
             ],
             vec!["-fc".to_string(), "100".to_string(), "8.8.8.8".to_string()],
+            // Clustered short options with an attached value: getopt parses
+            // `-fc100` as `-f -c 100` (flood ping, count 100).
+            vec!["-fc100".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), "0.01".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), ".001".to_string(), "8.8.8.8".to_string()],
             vec!["-i0.01".to_string(), "8.8.8.8".to_string()],
+            // Clustered form of the interval flag: `-ci0.01` is `-c -i 0.01`.
+            vec!["-ci0.01".to_string(), "8.8.8.8".to_string()],
         ] {
             assert!(
                 matches!(engine.evaluate("ping", &denied), Decision::Denied(_)),

@@ -21,7 +21,14 @@ decision.
    does, ultimately calls `RedWrenchServer::dispatch`, which is the only
    place that talks to the policy engine and the executor. Adding a new
    tool means adding a new file here and calling `dispatch`, not
-   reimplementing policy checks or process spawning.
+   reimplementing policy checks or process spawning. `dispatch` returns
+   `rmcp::model::CallToolResult` directly, not a plain string. Policy
+   denials and command timeouts both set `is_error: true` (via
+   `CallToolResult::error(...)`), so an MCP client can distinguish "the
+   command was denied or didn't finish" from a real successful result
+   without parsing text. If you add a new failure path to `dispatch`,
+   give it the same treatment, an `is_error: false` result should mean
+   the command actually ran and produced real output.
 4. **Execution and audit** (`src/executor.rs`, `src/audit.rs`): the only
    place a process is actually spawned, and the only place a journal
    entry is written. Always argv-based (`tokio::process`), never a

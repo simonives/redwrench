@@ -1,5 +1,17 @@
 use clap::{Parser, Subcommand};
-use redwrench::policy::tiers::TierName;
+
+// The build script (build.rs) includes this file directly and can't
+// see the redwrench library crate, so TierName is redeclared locally
+// as a build-time-only mirror for the purposes of man page generation.
+// The real TierName (src/policy/tiers.rs) still owns Deserialize and
+// the actual policy logic; this local copy exists purely so build.rs
+// can construct a clap Command without a circular crate dependency.
+#[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
+pub enum TierName {
+    Safe,
+    Standard,
+    Unrestricted,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "redwrench", about = "MCP server for Fedora hardware and OS control")]
@@ -51,7 +63,7 @@ mod tests {
         let cli = Cli::try_parse_from(["redwrench", "config", "set-tier", "unrestricted"]).unwrap();
         match cli.command {
             Some(Command::Config { command: ConfigCommand::SetTier { tier, i_understand_the_risk } }) => {
-                assert_eq!(tier, crate::policy::tiers::TierName::Unrestricted);
+                assert_eq!(tier, TierName::Unrestricted); // cli::TierName, not policy::tiers::TierName
                 assert!(!i_understand_the_risk);
             }
             _ => panic!("expected Config(SetTier) command"),

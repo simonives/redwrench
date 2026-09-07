@@ -14,6 +14,11 @@ async fn main() -> anyhow::Result<()> {
         Some(cli::Command::Config {
             command: cli::ConfigCommand::SetTier { tier, i_understand_the_risk },
         }) => {
+            let tier = match tier {
+                cli::TierName::Safe => policy::tiers::TierName::Safe,
+                cli::TierName::Standard => policy::tiers::TierName::Standard,
+                cli::TierName::Unrestricted => policy::tiers::TierName::Unrestricted,
+            };
             if matches!(tier, policy::tiers::TierName::Unrestricted) && !i_understand_the_risk {
                 eprintln!(
                     "WARNING: the 'unrestricted' tier allows every command with no \

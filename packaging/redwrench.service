@@ -1,0 +1,31 @@
+[Unit]
+Description=RedWrench MCP server for Fedora hardware and OS control
+Documentation=https://github.com/simonives/redwrench
+# RedWrench's audit trail goes to the journal, and its tools drive
+# systemd itself, so it should not start before either is up.
+After=network-online.target systemd-journald.socket
+Wants=network-online.target
+# The server refuses to start without a config file, so do not attempt it.
+ConditionPathExists=/etc/redwrench/config.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/redwrench --config /etc/redwrench/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# RedWrench executes privileged commands (systemctl, dnf) on the operator's
+# behalf, so it runs as root by design. Sandboxing directives that would
+# block that (ProtectSystem=strict, PrivateDevices, NoNewPrivileges) are
+# deliberately omitted; the security boundary is the policy engine and the
+# network the server is bound to, not the unit file.
+User=root
+
+# The audit trail is the point of this service, so keep both streams in the
+# journal. This also catches the stderr fallback subscriber the binary
+# installs when journald's native socket is unreachable.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

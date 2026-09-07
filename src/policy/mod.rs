@@ -97,4 +97,35 @@ mod tests {
         let decision = engine.evaluate("journalctl", &["-u".into(), "sshd".into()]);
         assert!(matches!(decision, Decision::Allowed));
     }
+
+    #[test]
+    fn a_trailing_shell_metacharacter_in_an_argument_does_not_bypass_a_deny_rule() {
+        let engine = PolicyEngine::new(vec![
+            rule("systemctl", Some("stop"), Effect::Deny),
+            rule("systemctl", None, Effect::Allow),
+        ]);
+        // Simulates an agent trying to smuggle a second command past the
+        // "stop" deny by appending it to the same argument.
+        let decision = engine.evaluate("systemctl", &["status".into(), "sshd; systemctl stop sshd".into()]);
+        // This must be Denied, because the joined-args string still
+        // contains "stop", and the deny rule for "stop" is checked before
+        // the allow rule. If this ever becomes Allowed, the rule
+        // ordering or matching logic has regressed.
+        assert!(matches!(decision, Decision::Denied(_)));
+    }
+
+    #[test]
+    fn args_are_never_shell_interpreted_by_the_engine_itself() {
+        // The policy engine only does regex matching on a joined string,
+        // it never invokes a shell. This test documents that the engine
+        // has no code path that could interpret `;`, `&&`, backticks,
+        // or `$()` as anything other than literal characters to match
+        // against. The real defence against shell interpretation lives
+        // in executor.rs (Task 6), which must invoke commands via
+        // tokio::process::Command with separate argv entries, never via
+        // a shell (`sh -c`).
+        let engine = PolicyEngine::new(vec![rule("echo", None, Effect::Allow)]);
+        let decision = engine.evaluate("echo", &["hello `rm -rf /`".into()]);
+        assert!(matches!(decision, Decision::Allowed));
+    }
 }

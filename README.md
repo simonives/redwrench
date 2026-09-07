@@ -86,8 +86,8 @@ it, so you narrow or widen any tier without editing the binary.
 
 | Tier | What it permits |
 | --- | --- |
-| `safe` | Read-only diagnostics: `systemctl status`/`is-active`/`is-enabled`, `journalctl` reads, `ping`, `ip` show/list/get. No mutation of system state. Journal-writing and flood-ping flags are explicitly denied. |
-| `standard` | Everything in `safe`, plus service start/stop/restart/enable/disable and `dnf`/`rpm-ostree` install/remove/upgrade. Flags that defeat package signature checking (`--nogpgcheck`, `--repofrompath`, `--setopt`) are explicitly denied. |
+| `safe` | Read-only diagnostics: `systemctl status`/`is-active`/`is-enabled`, `journalctl` reads, `ping`, `ip` show/list/get. No mutation of system state. Journal-writing flags, flood/abuse ping flags (`-f`, `-A`, `-l`, `-s`, zero intervals), and systemctl flags that redirect the operation off this machine (`--host`/`-H`, `--machine`/`-M`, `--root`) are explicitly denied. |
+| `standard` | Everything in `safe`, plus service start/stop/restart/enable/disable and `dnf`/`rpm-ostree` install/remove/upgrade. Flags that defeat package signature checking (`--nogpgcheck`, `--repofrompath`, `--setopt`) are explicitly denied, including the abbreviated forms dnf's argparse CLI accepts. |
 | `unrestricted` | Everything, including unfiltered raw command execution. No policy restrictions at all. |
 
 Switch tiers with `redwrench config set-tier <tier>`.

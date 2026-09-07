@@ -21,14 +21,35 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 /// arriving is a straggler, not the command's real output.
 const POST_EXIT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How much each pipe reader is allowed to buffer.
+///
+/// NOTE (post-review fix, unbounded allocation): the pipe readers used to
+/// call `read_to_end` with no bound and rely on [`truncate_output`] to cap
+/// the result afterwards. Truncating after the fact caps what the *agent*
+/// sees, not what the *server* allocates: a command such as
+/// `dd if=/dev/zero bs=1M count=5000` or a runaway `yes` would be buffered
+/// in full first, so the server could be OOM-killed long before the
+/// execution timeout ever fired. Bounding the read itself makes the peak
+/// allocation a small constant (1 MiB + 1 byte per pipe) no matter how much
+/// the command tries to produce.
+///
+/// The extra byte is what preserves the truncation signal: reading exactly
+/// `MAX_OUTPUT_BYTES` cannot be distinguished from a command whose output
+/// happened to be exactly that size, whereas reading one byte more proves
+/// there was more to come. Once the reader stops, the pipe's read end is
+/// dropped, the writer gets `EPIPE`/`SIGPIPE`, and the command dies rather
+/// than blocking forever on a full pipe.
+const READ_LIMIT_BYTES: u64 = MAX_OUTPUT_BYTES as u64 + 1;
+
 fn truncate_output(data: Vec<u8>) -> String {
     if data.len() > MAX_OUTPUT_BYTES {
         let truncated = &data[..MAX_OUTPUT_BYTES];
         let mut s = String::from_utf8_lossy(truncated).into_owned();
+        // The total is deliberately not reported: the read is bounded, so
+        // the full length of the command's output is not known here and
+        // claiming one would be a lie.
         s.push_str(&format!(
-            "\n... [output truncated, {} of {} bytes shown]",
-            MAX_OUTPUT_BYTES,
-            data.len()
+            "\n... [output truncated, only the first {MAX_OUTPUT_BYTES} bytes are shown]"
         ));
         s
     } else {
@@ -69,8 +90,8 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
         }
     };
 
-    let mut stdout = child.stdout.take().expect("stdout not configured as piped");
-    let mut stderr = child.stderr.take().expect("stderr not configured as piped");
+    let stdout = child.stdout.take().expect("stdout not configured as piped");
+    let stderr = child.stderr.take().expect("stderr not configured as piped");
 
     // Drain both pipes concurrently, starting now, regardless of
     // whether the process finishes or the timeout fires first. This
@@ -78,14 +99,18 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
     // after wait() resolves, a process producing more output than the
     // OS pipe buffer holds can block on write() forever, and wait()
     // then never resolves either.
+    //
+    // Each read is bounded by `READ_LIMIT_BYTES` (see the note there): the
+    // `.take()` adapter caps the reader itself, so the peak allocation is a
+    // small constant regardless of how much the command emits.
     let stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf).await;
+        let _ = stdout.take(READ_LIMIT_BYTES).read_to_end(&mut buf).await;
         buf
     });
     let stderr_task = tokio::spawn(async move {
         let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf).await;
+        let _ = stderr.take(READ_LIMIT_BYTES).read_to_end(&mut buf).await;
         buf
     });
 
@@ -201,6 +226,66 @@ mod tests {
         .await;
         assert!(result.stdout.len() <= MAX_OUTPUT_BYTES + 200);
         assert!(result.stdout.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn the_read_itself_is_bounded_so_a_firehose_command_cannot_exhaust_memory() {
+        // `seq 1 50000000` is roughly 480 MiB of output, ~480x the
+        // truncation limit. Before the read was bounded, every one of those
+        // bytes was buffered in a `Vec` before `truncate_output` ever ran,
+        // so a command like this (or `yes`, or `dd if=/dev/zero`) could
+        // OOM-kill the server well inside the execution timeout.
+        //
+        // Two things are asserted, and together they prove the *read* is
+        // bounded rather than only the returned string:
+        //
+        // 1. The captured output is at most one truncation limit plus the
+        //    note. This alone would also hold if the full 480 MiB had been
+        //    buffered and then trimmed.
+        // 2. It completes in a small fraction of the time reading 480 MiB
+        //    through a pipe takes. Once the bounded reader is satisfied it
+        //    drops the pipe's read end, `seq` takes `SIGPIPE` and dies, and
+        //    the whole call returns almost immediately. An unbounded read
+        //    has to drain every byte the command produces first.
+        let started = std::time::Instant::now();
+        let result = execute(
+            "seq",
+            &["1".to_string(), "50000000".to_string()],
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(
+            result.stdout.len() <= MAX_OUTPUT_BYTES + 200,
+            "captured {} bytes, the read is not bounded",
+            result.stdout.len()
+        );
+        assert!(result.stdout.contains("truncated"));
+        assert!(
+            !result.timed_out,
+            "the command should be cut short by the bounded read, not by the timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}; a bounded read should stop long before the command finishes",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_truncation_note_does_not_claim_a_total_output_size() {
+        // The read stops one byte past the limit, so the command's real
+        // total output length is unknown here. The note must say what was
+        // shown without inventing a denominator.
+        let result = execute(
+            "seq",
+            &["1".to_string(), "1000000".to_string()],
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(result.stdout.contains(&format!(
+            "[output truncated, only the first {MAX_OUTPUT_BYTES} bytes are shown]"
+        )));
     }
 
     #[tokio::test]

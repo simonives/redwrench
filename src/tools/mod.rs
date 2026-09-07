@@ -49,6 +49,16 @@ impl RedWrenchServer {
     // must reach the calling agent verbatim. `CallToolResult` itself
     // implements `IntoCallToolResult`, so `run_command` can return this
     // directly.
+    //
+    // A command timeout is treated the same way (also `CallToolResult::error`),
+    // not folded into the "success" shape: the spec's error-handling section
+    // groups a timeout with an internal server fault under "the agent
+    // receives a generic failure", drawing the success/failure line at the
+    // calling agent's perspective (did the call produce a usable result)
+    // rather than at policy-allowed vs policy-denied. A timed-out command has
+    // no real stdout/exit code to hand back, so it belongs on the same
+    // `is_error: true` side as a denial, not lumped in with an actually
+    // completed command's real output.
     pub async fn dispatch(&self, tool: &str, command: &str, args: Vec<String>) -> CallToolResult {
         match self.policy.evaluate(command, &args) {
             Decision::Denied(reason) => {
@@ -68,7 +78,7 @@ impl RedWrenchServer {
                     result.exit_code,
                 );
                 if result.timed_out {
-                    CallToolResult::success(vec![ContentBlock::text(format!(
+                    CallToolResult::error(vec![ContentBlock::text(format!(
                         "Command timed out after {:?}",
                         self.timeout
                     ))])
@@ -148,16 +158,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_reports_a_timeout_as_a_successful_but_timed_out_result() {
+    async fn dispatch_reports_a_timeout_as_a_structured_error_result() {
         let server = allow_all_server(Duration::from_millis(100));
         let result = server
             .dispatch("run_command", "sleep", vec!["5".to_string()])
             .await;
 
-        // A timeout is a policy-allowed command that didn't finish in time,
-        // not a policy denial, so it stays on the "Allowed" (non-error)
-        // shape, distinct from the Denied case's structured error.
-        assert_eq!(result.is_error, Some(false));
+        // A timeout produced no real output, so from the calling agent's
+        // perspective it is a failed call, same `is_error: true` shape as a
+        // policy denial, not the same shape as a command that actually
+        // completed with real stdout.
+        assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
         assert!(text.contains("timed out"), "unexpected text: {text}");
     }

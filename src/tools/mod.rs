@@ -6,6 +6,7 @@ use std::time::Duration;
 
 pub mod dnf;
 pub mod journalctl;
+pub mod network;
 pub mod run_command;
 pub mod systemctl;
 
@@ -37,7 +38,8 @@ impl RedWrenchServer {
             tool_router: Self::run_command_router()
                 + Self::systemctl_router()
                 + Self::dnf_router()
-                + Self::journalctl_router(),
+                + Self::journalctl_router()
+                + Self::network_router(),
         }
     }
 

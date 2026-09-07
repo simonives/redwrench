@@ -7,8 +7,8 @@
 
 RedWrench is a native, security-conscious MCP (Model Context Protocol)
 server that exposes hardware and OS control on a dedicated Fedora machine
-to AI coding agents (Claude Code, Google Antigravity) running elsewhere on
-the network. It lets an agent operate a physically or logically separate
+to AI coding agents (Claude Code, Codex, Google Antigravity, etc.) running
+elsewhere on the network. It lets an agent operate a physically or logically separate
 Fedora box, standard or immutable, KDE or GNOME or Server, without
 installing agent tooling on that box or exposing the operator's main
 workstations to full-exec risk.
@@ -223,24 +223,25 @@ domain and not a registered trademark).
 
 ## Development workflow
 
-Development happens on the maintainer's Mac (editing via Claude Code);
-build, test, and run cycles happen on the target Fedora box itself,
-since the Linux-specific facilities this project wraps (`systemctl`,
-D-Bus, `dnf`) cannot be meaningfully exercised on macOS. The two
-machines share a LAN in addition to being reachable over Tailscale; the
-dev-loop tooling uses the LAN address for lower-latency iteration, while
-the running MCP server itself is only ever bound to and reached via the
-Tailscale interface, keeping the "convenient for development" and "the
-actual production access model" paths clearly separate.
+RedWrench's Linux-specific facilities (`systemctl`, D-Bus, `dnf`) cannot
+be meaningfully built or exercised on a non-Linux machine, so the
+expected workflow is two-machine: edit on whatever development machine
+you use, but run `cargo build`/`cargo test`/the actual binary on a real
+Fedora box. If both machines share a LAN as well as a private overlay
+network (Tailscale or otherwise), it's worth using the LAN address for
+the dev-loop itself, lower latency for frequent iteration, while
+keeping the running MCP server bound only to the private overlay
+interface, so the "convenient for development" and "the actual
+production access model" paths stay clearly separate.
 
 A `justfile` (or `Makefile`) ships with a `remote-test` recipe (or
 equivalent) that rsyncs the working tree to the Fedora box and runs
 `cargo test` there over SSH, so this cross-machine loop doesn't require
 hand-typed SSH commands every session.
 
-Target hardware for initial development: a 2011 MacBook Pro running
-Fedora KDE, kept current with daily updates. Plain
-`x86_64-unknown-linux-gnu`, no unusual architecture considerations.
+No unusual architecture considerations are expected: plain
+`x86_64-unknown-linux-gnu` covers typical Fedora hardware, including
+older machines, without needing cross-compilation.
 
 ## Backlog / roadmap (post-v1.0)
 

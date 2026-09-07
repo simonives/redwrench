@@ -1,7 +1,7 @@
 use super::{Effect, Rule};
 use regex::Regex;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum TierName {
     Safe,

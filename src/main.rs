@@ -10,6 +10,54 @@ use tools::RedWrenchServer;
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
+    match cli.command {
+        Some(cli::Command::Config {
+            command: cli::ConfigCommand::SetTier { tier, i_understand_the_risk },
+        }) => {
+            if matches!(tier, policy::tiers::TierName::Unrestricted) && !i_understand_the_risk {
+                eprintln!(
+                    "WARNING: the 'unrestricted' tier allows every command with no \
+                     filtering, including destructive ones. This is not reversible \
+                     by redwrench itself once a destructive command has run. \
+                     If you understand this, re-run with --i-understand-the-risk."
+                );
+                return Err(anyhow::anyhow!(
+                    "refusing to set the 'unrestricted' tier without --i-understand-the-risk"
+                ));
+            }
+            update_tier_in_config(&cli.config, &tier)?;
+            println!("Active tier set to {tier:?}.");
+            Ok(())
+        }
+        None => run_server(&cli).await,
+    }
+}
+
+fn update_tier_in_config(
+    path: &std::path::Path,
+    tier: &policy::tiers::TierName,
+) -> anyhow::Result<()> {
+    // Minimal implementation: read the existing file as a TOML table,
+    // replace the `tier` key, write it back. Using toml::Value here
+    // rather than the strict Config/RawConfig structs from Task 5,
+    // since this needs to preserve unrelated keys (bearer_token,
+    // bind_address, custom_rules) without needing to know their shape.
+    let contents = std::fs::read_to_string(path)?;
+    let mut value: toml::Value = contents.parse()?;
+    let tier_str = match tier {
+        policy::tiers::TierName::Safe => "safe",
+        policy::tiers::TierName::Standard => "standard",
+        policy::tiers::TierName::Unrestricted => "unrestricted",
+    };
+    value
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config file is not a TOML table"))?
+        .insert("tier".to_string(), toml::Value::String(tier_str.to_string()));
+    std::fs::write(path, toml::to_string_pretty(&value)?)?;
+    Ok(())
+}
+
+async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     if let Err(err) = audit::init_journal_logging() {
         eprintln!("warning: could not initialise journal logging: {err}");
     }

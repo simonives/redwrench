@@ -157,9 +157,11 @@ const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
 /// * `--syn` — `--system` is the other `--sy` option.
 /// * `--rel` — `--relinquish-var` is the only `--re` … `--rel` option
 ///   (`--reverse` is `--rev`).
-/// * `--sm` — the undocumented `--smart-relinquish-var` is the only `--sm`
-///   option, and it mutates the journal the same way; it does not contain
-///   `--rel`, so it needs its own prefix.
+/// * `--sm` — kept as a defensive prefix for a `--smart-relinquish-var`
+///   sibling flag reported in some systemd sources but not independently
+///   confirmed here. No journalctl read option begins `--sm`, so the
+///   prefix costs nothing if the flag turns out not to exist, and closes
+///   the gap if it does.
 /// * `--set` — `--setup-keys` is the only `--set` option (`--since` is
 ///   `--si`).
 ///

@@ -1,0 +1,8 @@
+[build]
+# Fanless MacBook Air9,1 has no active cooling. Cargo's default job count
+# (one rustc per logical core) saturates all cores under sustained parallel
+# codegen, which pushed the machine into ThermalPressureLevelHeavy and
+# caused a WindowServer watchdog kill/restart on 2026-09-07 while building
+# RedWrench's dependency tree. Capping parallelism leaves headroom for
+# whatever else is running (Claude Code, MCP servers, etc.) alongside builds.
+jobs = 4

@@ -117,15 +117,20 @@ mod tests {
     #[test]
     fn args_are_never_shell_interpreted_by_the_engine_itself() {
         // The policy engine only does regex matching on a joined string,
-        // it never invokes a shell. This test documents that the engine
-        // has no code path that could interpret `;`, `&&`, backticks,
-        // or `$()` as anything other than literal characters to match
-        // against. The real defence against shell interpretation lives
-        // in executor.rs (Task 6), which must invoke commands via
-        // tokio::process::Command with separate argv entries, never via
-        // a shell (`sh -c`).
-        let engine = PolicyEngine::new(vec![rule("echo", None, Effect::Allow)]);
+        // it never invokes a shell. This test proves that a payload
+        // containing shell metacharacters (`;`, backticks, `$()`) reaches
+        // the matcher completely unmodified, no escaping, no substitution,
+        // no shell expansion happens anywhere in this code path. The real
+        // defence against shell interpretation lives in executor.rs
+        // (Task 6), which must invoke commands via tokio::process::Command
+        // with separate argv entries, never via a shell (`sh -c`).
+        let engine = PolicyEngine::new(vec![
+            rule("echo", Some("rm -rf"), Effect::Deny),
+        ]);
         let decision = engine.evaluate("echo", &["hello `rm -rf /`".into()]);
-        assert!(matches!(decision, Decision::Allowed));
+        match decision {
+            Decision::Denied(msg) => assert!(msg.contains("hello `rm -rf /`")),
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 }

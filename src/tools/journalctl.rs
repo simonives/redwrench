@@ -47,19 +47,35 @@ fn default_lines() -> u32 {
 // following flag the way it disambiguates a trailing positional.
 //
 // The correct equivalent protection here is validation, not separator
-// placement: reject any `unit` value that starts with `-` before it ever
-// reaches journalctl's argv, since such a value cannot be a legitimate
-// systemd unit name (unit names are drawn from alphanumerics and a small
-// set of punctuation, none of which is a leading hyphen) and passing it
-// through would only ever serve to smuggle a flag in.
+// placement: reject any `unit` value that starts with `--` before it ever
+// reaches journalctl's argv.
+//
+// NOTE (post-review correction, false positive on escaped unit names):
+// this was originally `unit.starts_with('-')` (single dash), which wrongly
+// rejected legitimate systemd unit names. systemd's unit-name escaping
+// convention produces names starting with a single `-`, e.g. `-.mount` is
+// the real, standard name for the root filesystem's mount unit; someone
+// diagnosing root-filesystem I/O errors with `journalctl -u -.mount` would
+// have been incorrectly blocked. Per getopt_long's semantics (see above),
+// `-u`'s required argument is consumed unconditionally as a single argv
+// token and is never re-scanned as a flag by journalctl's own parser once
+// consumed, so the two-token `-u <value>` form was likely never exploitable
+// for this injection class in the first place (unlike dnf's genuinely
+// vulnerable trailing positional argument). This check is therefore
+// defense-in-depth, not a confirmed-necessary fix, so it should be no
+// broader than the concrete risk it guards against: GNU long-option-style
+// flags, which all start with `--`, not `-`. Narrowing to `--` still
+// catches every concrete payload this file's tests exercise
+// (`--file=/etc/shadow`, `--directory=/root`, a bare `--`), while no longer
+// rejecting single-dash-escaped unit names like `-.mount`.
 fn journalctl_args(unit: Option<String>, lines: u32) -> Result<Vec<String>, String> {
     let mut args = vec!["-n".to_string(), lines.to_string(), "--no-pager".to_string()];
     if let Some(unit) = unit {
-        if unit.starts_with('-') {
+        if unit.starts_with("--") {
             return Err(format!(
-                "Invalid unit \"{unit}\": unit names cannot start with \"-\" \
-                (this would be interpreted as a journalctl flag rather than \
-                a unit name)"
+                "Invalid unit \"{unit}\": unit names cannot start with \"--\" \
+                (this would be interpreted as a journalctl long-option flag \
+                rather than a unit name)"
             ));
         }
         args.push("-u".to_string());
@@ -121,6 +137,28 @@ mod tests {
         // silently absorbed as -u's argument.
         let result = journalctl_args(Some("--".to_string()), 50);
         assert!(result.is_err(), "expected rejection, got {result:?}");
+    }
+
+    #[test]
+    fn a_single_dash_escaped_unit_name_is_accepted() {
+        // "-.mount" is the real, standard systemd-escaped unit name for the
+        // root filesystem's mount unit. It starts with a single dash, not a
+        // double dash, and must not be rejected by the "--" long-option
+        // guard: someone diagnosing root-filesystem I/O errors with
+        // `journalctl -u -.mount` needs this to work.
+        let args = journalctl_args(Some("-.mount".to_string()), 50).unwrap();
+        assert_eq!(args, vec!["-n", "50", "--no-pager", "-u", "-.mount"]);
+    }
+
+    #[test]
+    fn other_single_dash_prefixed_unit_names_are_accepted() {
+        // A couple more plausible single-dash-escaped names, to confirm the
+        // guard is specifically anchored on "--" and not just "starts with
+        // more than zero dashes".
+        for unit in ["-.slice", "-boot.mount"] {
+            let args = journalctl_args(Some(unit.to_string()), 50).unwrap();
+            assert_eq!(args, vec!["-n", "50", "--no-pager", "-u", unit]);
+        }
     }
 
     #[test]

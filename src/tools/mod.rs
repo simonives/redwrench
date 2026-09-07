@@ -4,6 +4,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool_handler, ServerHandler};
 use std::time::Duration;
 
+pub mod dnf;
 pub mod run_command;
 pub mod systemctl;
 
@@ -32,7 +33,7 @@ impl RedWrenchServer {
             policy,
             timeout,
             tier_name,
-            tool_router: Self::run_command_router() + Self::systemctl_router(),
+            tool_router: Self::run_command_router() + Self::systemctl_router() + Self::dnf_router(),
         }
     }
 

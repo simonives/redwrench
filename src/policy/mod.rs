@@ -1,5 +1,7 @@
 use regex::Regex;
 
+pub mod tiers;
+
 #[derive(Debug, Clone)]
 pub enum Effect {
     Allow,
@@ -32,7 +34,7 @@ impl PolicyEngine {
     pub fn evaluate(&self, command: &str, args: &[String]) -> Decision {
         let joined_args = args.join(" ");
         for rule in &self.rules {
-            if rule.command != command {
+            if !rule.command.is_empty() && rule.command != command {
                 continue;
             }
             let arg_matches = match &rule.arg_pattern {

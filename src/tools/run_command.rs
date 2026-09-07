@@ -1,4 +1,5 @@
 use super::RedWrenchServer;
+use rmcp::model::CallToolResult;
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde::Deserialize;
 
@@ -21,7 +22,7 @@ impl RedWrenchServer {
     pub async fn run_command(
         &self,
         Parameters(RunCommandParams { command, args }): Parameters<RunCommandParams>,
-    ) -> String {
+    ) -> CallToolResult {
         self.dispatch("run_command", &command, args).await
     }
 }

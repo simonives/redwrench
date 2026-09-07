@@ -1,5 +1,6 @@
 use crate::policy::{Decision, PolicyEngine};
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool_handler, ServerHandler};
 use std::time::Duration;
 
@@ -34,11 +35,28 @@ impl RedWrenchServer {
         }
     }
 
-    pub async fn dispatch(&self, tool: &str, command: &str, args: Vec<String>) -> String {
+    // NOTE (post-review fix): `dispatch` returns `rmcp::model::CallToolResult`
+    // rather than a bare `String`, so a policy denial is a structurally
+    // distinct, protocol-level result (`is_error: Some(true)`) rather than a
+    // successful result whose text merely happens to say "Denied: ...". This
+    // is `CallToolResult::error(...)`, not `Err(rmcp::ErrorData)`: rmcp's own
+    // docs on `CallToolResult::error` draw the line as "the tool ran and
+    // didn't work" (caller's client renders the content, message reaches the
+    // user) versus a protocol-level `ErrorData` ("the server cannot route
+    // the request at all", rendered opaquely, message does NOT reach the
+    // user). A policy denial is squarely the former: the tool executed, the
+    // policy check is part of its normal operation, and the reason string
+    // must reach the calling agent verbatim. `CallToolResult` itself
+    // implements `IntoCallToolResult`, so `run_command` can return this
+    // directly.
+    pub async fn dispatch(&self, tool: &str, command: &str, args: Vec<String>) -> CallToolResult {
         match self.policy.evaluate(command, &args) {
             Decision::Denied(reason) => {
                 crate::audit::record_invocation(tool, command, &self.tier_name, "denied", None);
-                format!("Denied: {reason} (active tier: {})", self.tier_name)
+                CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Denied: {reason} (active tier: {})",
+                    self.tier_name
+                ))])
             }
             Decision::Allowed => {
                 let result = crate::executor::execute(command, &args, self.timeout).await;
@@ -50,12 +68,15 @@ impl RedWrenchServer {
                     result.exit_code,
                 );
                 if result.timed_out {
-                    format!("Command timed out after {:?}", self.timeout)
+                    CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Command timed out after {:?}",
+                        self.timeout
+                    ))])
                 } else {
-                    format!(
+                    CallToolResult::success(vec![ContentBlock::text(format!(
                         "exit code: {:?}\nstdout:\n{}\nstderr:\n{}",
                         result.exit_code, result.stdout, result.stderr
-                    )
+                    ))])
                 }
             }
         }
@@ -64,3 +85,80 @@ impl RedWrenchServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RedWrenchServer {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Effect, Rule};
+
+    fn allow_all_server(timeout: Duration) -> RedWrenchServer {
+        RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(vec![Rule {
+                command: String::new(),
+                arg_pattern: None,
+                effect: Effect::Allow,
+            }])),
+            timeout,
+            "unrestricted".to_string(),
+        )
+    }
+
+    fn deny_all_server(timeout: Duration) -> RedWrenchServer {
+        RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(vec![])),
+            timeout,
+            "safe".to_string(),
+        )
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text())
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_a_structured_error_result_when_the_policy_denies() {
+        let server = deny_all_server(Duration::from_secs(5));
+        let result = server
+            .dispatch("run_command", "rm", vec!["-rf".to_string(), "/".to_string()])
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
+        assert!(text.starts_with("Denied:"), "unexpected text: {text}");
+        assert!(text.contains("active tier: safe"), "unexpected text: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_a_successful_result_with_real_output_when_the_policy_allows() {
+        let server = allow_all_server(Duration::from_secs(5));
+        let result = server
+            .dispatch("run_command", "echo", vec!["hello".to_string()])
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let text = text_of(&result);
+        assert!(text.contains("exit code: Some(0)"), "unexpected text: {text}");
+        assert!(text.contains("hello"), "unexpected text: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_reports_a_timeout_as_a_successful_but_timed_out_result() {
+        let server = allow_all_server(Duration::from_millis(100));
+        let result = server
+            .dispatch("run_command", "sleep", vec!["5".to_string()])
+            .await;
+
+        // A timeout is a policy-allowed command that didn't finish in time,
+        // not a policy denial, so it stays on the "Allowed" (non-error)
+        // shape, distinct from the Denied case's structured error.
+        assert_eq!(result.is_error, Some(false));
+        let text = text_of(&result);
+        assert!(text.contains("timed out"), "unexpected text: {text}");
+    }
+}

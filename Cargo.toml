@@ -6,11 +6,19 @@ license = "MIT OR Apache-2.0"
 description = "A security-conscious MCP server exposing Fedora hardware and OS control to AI coding agents"
 repository = "https://github.com/simonives/redwrench"
 
+[lib]
+name = "redwrench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "redwrench"
+path = "src/main.rs"
+
 [dependencies]
 rmcp = { version = "3.0", features = ["server", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 serde = { version = "1.0", features = ["derive"] }
 schemars = "0.8"
 toml = "0.8"

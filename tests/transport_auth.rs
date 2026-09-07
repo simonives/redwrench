@@ -7,12 +7,12 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn rejects_requests_without_a_valid_bearer_token() {
     let token = "expected-token".to_string();
-    let app = Router::new().route("/ping", get(|| async { "pong" })).layer(
-        axum::middleware::from_fn(move |req, next| {
+    let app = Router::new()
+        .route("/ping", get(|| async { "pong" }))
+        .layer(axum::middleware::from_fn(move |req, next| {
             let token = token.clone();
             async move { redwrench::auth::require_bearer_token(token, req, next).await }
-        }),
-    );
+        }));
 
     let response = app
         .oneshot(

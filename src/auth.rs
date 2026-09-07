@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
 use axum::extract::Request;
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use std::net::SocketAddr;
 
 pub fn validate_bind_address(addr: &str, allow_public: bool) -> anyhow::Result<()> {
     let socket_addr: SocketAddr = addr

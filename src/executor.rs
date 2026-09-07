@@ -126,7 +126,12 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stderr_and_nonzero_exit_code_of_a_failing_command() {
-        let result = execute("ls", &["/nonexistent-path-xyz".to_string()], Duration::from_secs(5)).await;
+        let result = execute(
+            "ls",
+            &["/nonexistent-path-xyz".to_string()],
+            Duration::from_secs(5),
+        )
+        .await;
         assert_ne!(result.exit_code, Some(0));
         assert!(!result.stderr.is_empty());
     }

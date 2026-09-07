@@ -44,7 +44,8 @@ impl RedWrenchServer {
         &self,
         Parameters(DnfPackageParams { package }): Parameters<DnfPackageParams>,
     ) -> CallToolResult {
-        self.dispatch("dnf_install", "dnf", install_argv(package)).await
+        self.dispatch("dnf_install", "dnf", install_argv(package))
+            .await
     }
 
     #[tool(description = "Remove a package via dnf. Requires the 'standard' tier.")]
@@ -52,7 +53,8 @@ impl RedWrenchServer {
         &self,
         Parameters(DnfPackageParams { package }): Parameters<DnfPackageParams>,
     ) -> CallToolResult {
-        self.dispatch("dnf_remove", "dnf", remove_argv(package)).await
+        self.dispatch("dnf_remove", "dnf", remove_argv(package))
+            .await
     }
 }
 
@@ -69,7 +71,10 @@ mod tests {
         // index is immediately before the (last) package element, so a
         // flag-like package value can never be mistaken by dnf for an
         // option rather than a positional argument.
-        let dash_pos = args.iter().position(|a| a == "--").expect("-- separator missing");
+        let dash_pos = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator missing");
         assert_eq!(dash_pos, args.len() - 2);
         assert_eq!(args.last().unwrap(), "--nogpgcheck");
     }
@@ -87,7 +92,10 @@ mod tests {
             ]
         );
 
-        let dash_pos = args.iter().position(|a| a == "--").expect("-- separator missing");
+        let dash_pos = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator missing");
         assert_eq!(dash_pos, args.len() - 2);
     }
 

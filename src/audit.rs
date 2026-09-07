@@ -6,7 +6,13 @@ pub fn init_journal_logging() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn record_invocation(tool: &str, command: &str, tier: &str, decision: &str, exit_code: Option<i32>) {
+pub fn record_invocation(
+    tool: &str,
+    command: &str,
+    tier: &str,
+    decision: &str,
+    exit_code: Option<i32>,
+) {
     tracing::info!(
         target: "redwrench::audit",
         tool,

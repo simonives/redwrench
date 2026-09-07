@@ -31,7 +31,10 @@ fn safe_rules() -> Vec<Rule> {
         },
         allow("journalctl", None),
         allow("ping", None),
-        allow("ip", Some(r"^(addr|route|link)(\s+(show|list|get)(\s.*)?)?$")),
+        allow(
+            "ip",
+            Some(r"^(addr|route|link)(\s+(show|list|get)(\s.*)?)?$"),
+        ),
     ]
 }
 

@@ -120,7 +120,8 @@ mod tests {
         );
         let config = Config::load(file.path()).unwrap();
         let rules = config.effective_rules();
-        let tier_only_len = crate::policy::tiers::rules_for_tier(&crate::policy::tiers::TierName::Safe).len();
+        let tier_only_len =
+            crate::policy::tiers::rules_for_tier(&crate::policy::tiers::TierName::Safe).len();
         assert_eq!(rules.len(), tier_only_len + 1);
         assert_eq!(rules.last().unwrap().command, "curl");
     }
@@ -165,6 +166,9 @@ mod tests {
         );
         let result = Config::load(file.path());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty arg_pattern"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("empty arg_pattern"));
     }
 }

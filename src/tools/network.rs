@@ -42,7 +42,9 @@ fn ping_argv(host: String, count: u32) -> Vec<String> {
 
 #[tool_router(router = network_router, vis = "pub(crate)")]
 impl RedWrenchServer {
-    #[tool(description = "Ping a host to check basic network reachability. Allowed under every tier.")]
+    #[tool(
+        description = "Ping a host to check basic network reachability. Allowed under every tier."
+    )]
     pub async fn ping(
         &self,
         Parameters(PingParams { host, count }): Parameters<PingParams>,
@@ -65,7 +67,10 @@ mod tests {
         let args = ping_argv("-f".to_string(), 4);
         assert_eq!(args, vec!["-c", "4", "--", "-f"]);
 
-        let dash_pos = args.iter().position(|a| a == "--").expect("-- separator missing");
+        let dash_pos = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator missing");
         assert_eq!(dash_pos, args.len() - 2);
         assert_eq!(args.last().unwrap(), "-f");
     }

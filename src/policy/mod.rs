@@ -46,9 +46,9 @@ impl PolicyEngine {
             }
             return match rule.effect {
                 Effect::Allow => Decision::Allowed,
-                Effect::Deny => Decision::Denied(format!(
-                    "'{command} {joined_args}' is denied by policy"
-                )),
+                Effect::Deny => {
+                    Decision::Denied(format!("'{command} {joined_args}' is denied by policy"))
+                }
             };
         }
         Decision::Denied(format!(
@@ -108,7 +108,10 @@ mod tests {
         ]);
         // Simulates an agent trying to smuggle a second command past the
         // "stop" deny by appending it to the same argument.
-        let decision = engine.evaluate("systemctl", &["status".into(), "sshd; systemctl stop sshd".into()]);
+        let decision = engine.evaluate(
+            "systemctl",
+            &["status".into(), "sshd; systemctl stop sshd".into()],
+        );
         // This must be Denied, because the joined-args string still
         // contains "stop", and the deny rule for "stop" is checked before
         // the allow rule. If this ever becomes Allowed, the rule
@@ -126,9 +129,7 @@ mod tests {
         // defence against shell interpretation lives in executor.rs
         // (Task 6), which must invoke commands via tokio::process::Command
         // with separate argv entries, never via a shell (`sh -c`).
-        let engine = PolicyEngine::new(vec![
-            rule("echo", Some("rm -rf"), Effect::Deny),
-        ]);
+        let engine = PolicyEngine::new(vec![rule("echo", Some("rm -rf"), Effect::Deny)]);
         let decision = engine.evaluate("echo", &["hello `rm -rf /`".into()]);
         match decision {
             Decision::Denied(msg) => assert!(msg.contains("hello `rm -rf /`")),

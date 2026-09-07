@@ -14,7 +14,10 @@ pub enum TierName {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "redwrench", about = "MCP server for Fedora hardware and OS control")]
+#[command(
+    name = "redwrench",
+    about = "MCP server for Fedora hardware and OS control"
+)]
 pub struct Cli {
     /// Path to the config file.
     #[arg(long, default_value = "/etc/redwrench/config.toml", global = true)]
@@ -62,7 +65,13 @@ mod tests {
     fn set_tier_unrestricted_requires_the_risk_flag() {
         let cli = Cli::try_parse_from(["redwrench", "config", "set-tier", "unrestricted"]).unwrap();
         match cli.command {
-            Some(Command::Config { command: ConfigCommand::SetTier { tier, i_understand_the_risk } }) => {
+            Some(Command::Config {
+                command:
+                    ConfigCommand::SetTier {
+                        tier,
+                        i_understand_the_risk,
+                    },
+            }) => {
                 assert_eq!(tier, TierName::Unrestricted); // cli::TierName, not policy::tiers::TierName
                 assert!(!i_understand_the_risk);
             }

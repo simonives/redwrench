@@ -12,7 +12,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(cli::Command::Config {
-            command: cli::ConfigCommand::SetTier { tier, i_understand_the_risk },
+            command:
+                cli::ConfigCommand::SetTier {
+                    tier,
+                    i_understand_the_risk,
+                },
         }) => {
             let tier = match tier {
                 cli::TierName::Safe => policy::tiers::TierName::Safe,
@@ -57,7 +61,10 @@ fn update_tier_in_config(
     value
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config file is not a TOML table"))?
-        .insert("tier".to_string(), toml::Value::String(tier_str.to_string()));
+        .insert(
+            "tier".to_string(),
+            toml::Value::String(tier_str.to_string()),
+        );
     std::fs::write(path, toml::to_string_pretty(&value)?)?;
     Ok(())
 }
@@ -113,12 +120,13 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     );
 
     let bearer_token = config.bearer_token.clone();
-    let router = axum::Router::new().nest_service("/mcp", service).layer(
-        axum::middleware::from_fn(move |req, next| {
-            let token = bearer_token.clone();
-            async move { auth::require_bearer_token(token, req, next).await }
-        }),
-    );
+    let router =
+        axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let token = bearer_token.clone();
+                async move { auth::require_bearer_token(token, req, next).await }
+            }));
 
     let listener = tokio::net::TcpListener::bind(&config.bind_address).await?;
     tracing::info!(target: "redwrench::audit", bind_address = %config.bind_address, "redwrench starting");

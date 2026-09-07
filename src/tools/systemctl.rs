@@ -19,7 +19,9 @@ pub struct SystemctlControlParams {
 
 #[tool_router(router = systemctl_router, vis = "pub(crate)")]
 impl RedWrenchServer {
-    #[tool(description = "Check the status of a systemd unit (read-only, allowed under every tier).")]
+    #[tool(
+        description = "Check the status of a systemd unit (read-only, allowed under every tier)."
+    )]
     pub async fn systemctl_status(
         &self,
         Parameters(SystemctlStatusParams { unit }): Parameters<SystemctlStatusParams>,

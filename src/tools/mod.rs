@@ -143,13 +143,20 @@ mod tests {
     async fn dispatch_returns_a_structured_error_result_when_the_policy_denies() {
         let server = deny_all_server(Duration::from_secs(5));
         let result = server
-            .dispatch("run_command", "rm", vec!["-rf".to_string(), "/".to_string()])
+            .dispatch(
+                "run_command",
+                "rm",
+                vec!["-rf".to_string(), "/".to_string()],
+            )
             .await;
 
         assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
         assert!(text.starts_with("Denied:"), "unexpected text: {text}");
-        assert!(text.contains("active tier: safe"), "unexpected text: {text}");
+        assert!(
+            text.contains("active tier: safe"),
+            "unexpected text: {text}"
+        );
     }
 
     #[tokio::test]
@@ -161,7 +168,10 @@ mod tests {
 
         assert_eq!(result.is_error, Some(false));
         let text = text_of(&result);
-        assert!(text.contains("exit code: Some(0)"), "unexpected text: {text}");
+        assert!(
+            text.contains("exit code: Some(0)"),
+            "unexpected text: {text}"
+        );
         assert!(text.contains("hello"), "unexpected text: {text}");
     }
 

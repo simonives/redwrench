@@ -69,7 +69,11 @@ fn default_lines() -> u32 {
 // (`--file=/etc/shadow`, `--directory=/root`, a bare `--`), while no longer
 // rejecting single-dash-escaped unit names like `-.mount`.
 fn journalctl_args(unit: Option<String>, lines: u32) -> Result<Vec<String>, String> {
-    let mut args = vec!["-n".to_string(), lines.to_string(), "--no-pager".to_string()];
+    let mut args = vec![
+        "-n".to_string(),
+        lines.to_string(),
+        "--no-pager".to_string(),
+    ];
     if let Some(unit) = unit {
         if unit.starts_with("--") {
             return Err(format!(

@@ -1,4 +1,6 @@
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[derive(Debug)]
@@ -9,30 +11,99 @@ pub struct ExecutionResult {
     pub timed_out: bool,
 }
 
-pub async fn execute(command: &str, args: &[String], timeout: Duration) -> ExecutionResult {
-    let child = Command::new(command)
-        .args(args)
-        .output();
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
-    match tokio::time::timeout(timeout, child).await {
-        Ok(Ok(output)) => ExecutionResult {
-            exit_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            timed_out: false,
+fn truncate_output(data: Vec<u8>) -> String {
+    if data.len() > MAX_OUTPUT_BYTES {
+        let truncated = &data[..MAX_OUTPUT_BYTES];
+        let mut s = String::from_utf8_lossy(truncated).into_owned();
+        s.push_str(&format!(
+            "\n... [output truncated, {} of {} bytes shown]",
+            MAX_OUTPUT_BYTES,
+            data.len()
+        ));
+        s
+    } else {
+        String::from_utf8_lossy(&data).into_owned()
+    }
+}
+
+pub async fn execute(command: &str, args: &[String], timeout: Duration) -> ExecutionResult {
+    let mut child = match Command::new(command)
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return ExecutionResult {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("failed to spawn command: {err}"),
+                timed_out: false,
+            };
+        }
+    };
+
+    // Take ownership of stdout and stderr handles
+    let mut stdout = child.stdout.take().expect("stdout not configured as piped");
+    let mut stderr = child.stderr.take().expect("stderr not configured as piped");
+
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+
+    tokio::select! {
+        status = child.wait() => {
+            // Process completed before timeout - now read output
+            let (stdout_data, stderr_data) = tokio::join!(
+                async {
+                    let mut buf = Vec::new();
+                    let _ = stdout.read_to_end(&mut buf).await;
+                    buf
+                },
+                async {
+                    let mut buf = Vec::new();
+                    let _ = stderr.read_to_end(&mut buf).await;
+                    buf
+                }
+            );
+            match status {
+                Ok(status) => {
+                    ExecutionResult {
+                        exit_code: status.code(),
+                        stdout: truncate_output(stdout_data),
+                        stderr: truncate_output(stderr_data),
+                        timed_out: false,
+                    }
+                },
+                Err(err) => {
+                    ExecutionResult {
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: format!("command failed: {err}"),
+                        timed_out: false,
+                    }
+                }
+            }
         },
-        Ok(Err(err)) => ExecutionResult {
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!("failed to spawn command: {err}"),
-            timed_out: false,
-        },
-        Err(_elapsed) => ExecutionResult {
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!("command timed out after {timeout:?}"),
-            timed_out: true,
-        },
+        _ = &mut sleep => {
+            // Timeout fired - kill the child process
+            // Explicitly call kill() to send the signal immediately
+            let _ = child.kill().await;
+            // Drop stdout/stderr to close pipes
+            drop(stdout);
+            drop(stderr);
+            // The child will be killed and reaped due to kill_on_drop(true)
+            // No need to wait() here as that might delay the return
+            ExecutionResult {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("command timed out after {timeout:?}"),
+                timed_out: true,
+            }
+        }
     }
 }
 
@@ -75,5 +146,41 @@ mod tests {
         let result = execute("sleep", &["5".to_string()], Duration::from_millis(100)).await;
         assert!(result.timed_out);
         assert_eq!(result.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn a_killed_command_does_not_continue_running_after_timeout() {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_str().unwrap().to_string();
+        // The executor still only ever passes `sh` and its args as literal
+        // argv entries here, it never builds a shell string itself, "sh" is
+        // just the target program under test, same as "echo" or "sleep"
+        // elsewhere in this file.
+        let result = execute(
+            "sh",
+            &["-c".to_string(), format!("sleep 1 && touch {marker_path}")],
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(result.timed_out);
+        // If the process were still running, sleep 1 would finish and the
+        // marker would appear well within this window.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !std::path::Path::new(&marker_path).exists(),
+            "process kept running after the reported timeout, marker file was created"
+        );
+    }
+
+    #[tokio::test]
+    async fn very_large_output_is_truncated_with_a_note() {
+        let result = execute(
+            "seq",
+            &["1".to_string(), "1000000".to_string()],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(result.stdout.len() <= MAX_OUTPUT_BYTES + 200);
+        assert!(result.stdout.contains("truncated"));
     }
 }

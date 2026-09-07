@@ -14,6 +14,7 @@ pub struct Rule {
 }
 
 #[derive(Debug, PartialEq)]
+#[must_use]
 pub enum Decision {
     Allowed,
     Denied(String),

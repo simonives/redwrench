@@ -230,27 +230,29 @@ mod tests {
 
     #[tokio::test]
     async fn the_read_itself_is_bounded_so_a_firehose_command_cannot_exhaust_memory() {
-        // `seq 1 50000000` is roughly 480 MiB of output, ~480x the
+        // `seq 1 500000000` is roughly 5 GiB of output, ~5000x the
         // truncation limit. Before the read was bounded, every one of those
         // bytes was buffered in a `Vec` before `truncate_output` ever ran,
         // so a command like this (or `yes`, or `dd if=/dev/zero`) could
         // OOM-kill the server well inside the execution timeout.
         //
-        // Two things are asserted, and together they prove the *read* is
-        // bounded rather than only the returned string:
-        //
-        // 1. The captured output is at most one truncation limit plus the
-        //    note. This alone would also hold if the full 480 MiB had been
-        //    buffered and then trimmed.
-        // 2. It completes in a small fraction of the time reading 480 MiB
-        //    through a pipe takes. Once the bounded reader is satisfied it
-        //    drops the pipe's read end, `seq` takes `SIGPIPE` and dies, and
-        //    the whole call returns almost immediately. An unbounded read
-        //    has to drain every byte the command produces first.
+        // Elapsed time is the *sole* discriminator here. Neither of the
+        // other assertions distinguishes the bounded path from the buggy
+        // unbounded one: the length check would also hold if the full 5 GiB
+        // had been buffered and then trimmed, and `!timed_out` would also
+        // hold because an unbounded read still finishes inside the
+        // command's own 60s timeout, just far more slowly. What only the
+        // bounded read can do is return in a small fraction of the time
+        // draining 5 GiB through a pipe takes: once the bounded reader is
+        // satisfied it drops the pipe's read end, `seq` takes `SIGPIPE` and
+        // dies, and the whole call returns almost immediately. The 4s bound
+        // below leaves generous headroom over that near-instant return
+        // while staying far under what any real `seq`/shell implementation
+        // needs to produce 5 GiB.
         let started = std::time::Instant::now();
         let result = execute(
             "seq",
-            &["1".to_string(), "50000000".to_string()],
+            &["1".to_string(), "500000000".to_string()],
             Duration::from_secs(60),
         )
         .await;
@@ -266,7 +268,7 @@ mod tests {
             "the command should be cut short by the bounded read, not by the timeout"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < Duration::from_secs(4),
             "took {:?}; a bounded read should stop long before the command finishes",
             started.elapsed()
         );

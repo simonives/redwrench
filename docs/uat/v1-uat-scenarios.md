@@ -96,11 +96,13 @@ real Fedora box actually behave safely when handed those hardened
 argv vectors end-to-end. Run all three:
 
 1. Call `dnf_install` with `{"package": "--nogpgcheck"}`.
-   **Expected:** dnf fails cleanly looking for a literal package
-   named `--nogpgcheck` (which does not exist) rather than actually
-   disabling GPG verification. Confirm via `dnf history` (or
-   equivalent) that no install with GPG checking disabled occurred,
-   and that no package named `nogpgcheck` or similar was installed.
+   **Expected:** the call is rejected by RedWrench's policy engine
+   before dispatch, so dnf is never invoked at all. The `--` separator
+   makes the value a literal package name, and the tier's dnf deny rule
+   matches it. Confirm via `dnf history` (or equivalent) that no
+   install occurred, and that no package named `nogpgcheck` or similar
+   was installed. The `--` hardening is the second line of defence
+   here; the policy deny is the first.
 2. Call `journalctl_tail` with `{"unit": "--file=/etc/shadow"}`.
    **Expected:** the call is rejected by RedWrench's own validation
    before journalctl ever runs (a clear error message naming the

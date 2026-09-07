@@ -95,8 +95,24 @@ const PING_ABUSE_FLAGS: &str = concat!(
 /// Placed in `safe_rules()`, which `standard_rules()` extends rather than
 /// replaces, so a single rule precedes both the `^status` allow (safe) and
 /// the `^(start|stop|...)` allow (standard) under first-match-wins.
-const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str =
-    r"(?:^|\s)--(?:host|machine|root)|(?:^|\s)-[A-Za-z]*[HM]";
+///
+/// The long-flag half matches *prefixes*, not full names. `systemctl` parses
+/// its options with glibc `getopt_long`, which accepts any unambiguous
+/// abbreviation of a long option, so `--ho=evil.example` reaches `--host`
+/// while containing none of the letters a full-name pattern looks for. This
+/// is the same bypass class already closed for dnf's `--nog`/`--repof`.
+/// Each prefix below is the shortest form `systemctl` itself resolves
+/// uniquely, so every abbreviation it would accept necessarily contains it:
+/// * `--ho` — the only other `--h` option is `--help` (`--he`).
+/// * `--mac` — `--marked`, `--message` and `--mkdir` diverge by the third
+///   letter, so `--mac` resolves uniquely to `--machine`.
+/// * `--ro` — `--root` is the only `--ro` option; `--read-only`,
+///   `--recursive` and `--reverse` are `--re`, and `--runtime` is `--ru`.
+///
+/// Requiring the leading `--` (and a word boundary before it) keeps these
+/// short prefixes from matching a unit name that happens to contain the
+/// same letters.
+const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro)|(?:^|\s)-[A-Za-z]*[HM]";
 
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
@@ -128,8 +144,32 @@ const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
 /// rather than read from it. `--setup-keys` generates and writes Forward
 /// Secure Sealing keys, so it belongs with the vacuum/rotate family even
 /// though its name does not suggest mutation.
-const JOURNALCTL_MUTATION_FLAGS: &str =
-    r"vacuum|--rotate|--flush|--sync|--relinquish-var|--setup-keys";
+///
+/// As with dnf and systemctl, these match *prefixes*: `journalctl` parses
+/// its options with glibc `getopt_long`, so any unambiguous abbreviation of
+/// a long option is accepted and `--rot` mutates the journal exactly as
+/// `--rotate` does. Each prefix is the shortest form journalctl resolves
+/// uniquely, so every abbreviation it would accept contains it:
+/// * `--rot` — `--root` is the other `--ro` option, so `--rot` is the
+///   shortest prefix that reaches `--rotate`.
+/// * `--fl` — `--flush` is the only `--fl` option (`--file`, `--follow`,
+///   `--full`, `--force`, `--facility` and `--field` all diverge sooner).
+/// * `--syn` — `--system` is the other `--sy` option.
+/// * `--rel` — `--relinquish-var` is the only `--re` … `--rel` option
+///   (`--reverse` is `--rev`).
+/// * `--sm` — the undocumented `--smart-relinquish-var` is the only `--sm`
+///   option, and it mutates the journal the same way; it does not contain
+///   `--rel`, so it needs its own prefix.
+/// * `--set` — `--setup-keys` is the only `--set` option (`--since` is
+///   `--si`).
+///
+/// `vacuum` stays a bare substring: `--vac` is ambiguous across
+/// `--vacuum-size`, `--vacuum-time` and `--vacuum-files`, so the shortest
+/// abbreviation journalctl accepts already spells `vacuum` in full.
+///
+/// Requiring the leading `--` on the rest keeps these short prefixes from
+/// matching a unit name or grep pattern containing the same letters.
+const JOURNALCTL_MUTATION_FLAGS: &str = r"vacuum|--rot|--fl|--syn|--rel|--sm|--set";
 
 fn safe_rules() -> Vec<Rule> {
     vec![
@@ -446,6 +486,38 @@ mod tests {
                     "--host=attacker@evil.example".to_string(),
                     "sshd".to_string(),
                 ],
+                // getopt_long accepts any unambiguous abbreviation, so the
+                // deny has to match prefixes rather than full flag names.
+                vec![
+                    "status".to_string(),
+                    "--ho=evil.example".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--hos=evil.example".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--mac=container".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--ro=/mnt/other".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--roo=/mnt/other".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "start".to_string(),
+                    "--ho=evil.example".to_string(),
+                    "sshd".to_string(),
+                ],
             ] {
                 assert!(
                     matches!(engine.evaluate("systemctl", &denied), Decision::Denied(_)),
@@ -458,6 +530,24 @@ mod tests {
             for allowed in [
                 vec!["status".to_string(), "sshd".to_string()],
                 vec!["status".to_string(), "--".to_string(), "sshd".to_string()],
+                // Real long options that share leading letters with the
+                // denied ones must survive the prefix matching.
+                vec![
+                    "status".to_string(),
+                    "--no-pager".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--recursive".to_string(),
+                    "--reverse".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--type=service".to_string(),
+                    "sshd".to_string(),
+                ],
             ] {
                 assert!(
                     matches!(engine.evaluate("systemctl", &allowed), Decision::Allowed),
@@ -528,6 +618,50 @@ mod tests {
             ),
             Decision::Allowed
         ));
+    }
+
+    #[test]
+    fn safe_tier_denies_abbreviated_journalctl_mutation_flags() {
+        // journalctl uses glibc getopt_long, which accepts any unambiguous
+        // abbreviation of a long option, so `--rot` rotates the journal
+        // exactly as `--rotate` does while containing none of the letters a
+        // full-name pattern looks for.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        for denied in [
+            vec!["--rot".to_string()],
+            vec!["--rota".to_string()],
+            vec!["--fl".to_string()],
+            vec!["--flu".to_string()],
+            vec!["--syn".to_string()],
+            vec!["--rel".to_string()],
+            vec!["--relin".to_string()],
+            vec!["--sm".to_string()],
+            vec!["--set".to_string()],
+            vec!["--setu".to_string()],
+            vec!["--vacuum-size=1M".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("journalctl", &denied), Decision::Denied(_)),
+                "journalctl {denied:?} should be denied under the safe tier"
+            );
+        }
+
+        // Ordinary reads, including flags that share leading letters with
+        // the denied ones, stay allowed.
+        for allowed in [
+            vec!["-u".to_string(), "sshd".to_string()],
+            vec!["--since".to_string(), "today".to_string()],
+            vec!["--follow".to_string(), "--no-pager".to_string()],
+            vec!["--reverse".to_string(), "--full".to_string()],
+            vec!["--system".to_string(), "--utc".to_string()],
+            vec!["--root=/mnt/other".to_string()],
+            vec!["--file".to_string(), "/var/log/journal/x".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("journalctl", &allowed), Decision::Allowed),
+                "journalctl {allowed:?} should be allowed under the safe tier"
+            );
+        }
     }
 
     #[test]

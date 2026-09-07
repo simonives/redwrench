@@ -70,7 +70,14 @@ impl RedWrenchServer {
     pub async fn dispatch(&self, tool: &str, command: &str, args: Vec<String>) -> CallToolResult {
         match self.policy.evaluate(command, &args) {
             Decision::Denied(reason) => {
-                crate::audit::record_invocation(tool, command, &self.tier_name, "denied", None);
+                crate::audit::record_invocation(
+                    tool,
+                    command,
+                    &args,
+                    &self.tier_name,
+                    "denied",
+                    None,
+                );
                 CallToolResult::error(vec![ContentBlock::text(format!(
                     "Denied: {reason} (active tier: {})",
                     self.tier_name
@@ -81,6 +88,7 @@ impl RedWrenchServer {
                 crate::audit::record_invocation(
                     tool,
                     command,
+                    &args,
                     &self.tier_name,
                     "allowed",
                     result.exit_code,

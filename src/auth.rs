@@ -32,6 +32,22 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Strips the `Bearer ` scheme prefix from an `Authorization` header value.
+///
+/// RFC 7235 §2.1 makes the auth-scheme token case-insensitive, so a client
+/// sending `bearer <token>` or `BEARER <token>` is conformant and must be
+/// accepted. Only the scheme is case-insensitive; the credential itself is
+/// returned untouched and still compared byte-for-byte in constant time.
+fn strip_bearer_prefix(value: &str) -> Option<&str> {
+    const SCHEME: &str = "bearer ";
+    let (scheme, token) = value.split_at_checked(SCHEME.len())?;
+    if scheme.eq_ignore_ascii_case(SCHEME) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
 pub async fn require_bearer_token(expected_token: String, req: Request, next: Next) -> Response {
     if expected_token.is_empty() {
         tracing::warn!(target: "redwrench::audit", "rejected request: server has an empty expected bearer token configured");
@@ -45,7 +61,7 @@ pub async fn require_bearer_token(expected_token: String, req: Request, next: Ne
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(strip_bearer_prefix);
 
     match provided {
         Some(token) if constant_time_eq(token, &expected_token) => next.run(req).await,
@@ -97,5 +113,31 @@ mod tests {
     fn allows_bracketed_ipv6_wildcard_with_explicit_override() {
         let result = validate_bind_address("[::]:8443", true);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn the_bearer_scheme_prefix_is_matched_case_insensitively() {
+        // RFC 7235 §2.1: the auth-scheme token is case-insensitive.
+        for header_value in [
+            "Bearer s3cr3t",
+            "bearer s3cr3t",
+            "BEARER s3cr3t",
+            "BeArEr s3cr3t",
+        ] {
+            assert_eq!(
+                strip_bearer_prefix(header_value),
+                Some("s3cr3t"),
+                "failed for {header_value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_credential_itself_stays_case_sensitive_and_other_schemes_are_rejected() {
+        assert_eq!(strip_bearer_prefix("Bearer S3CR3T"), Some("S3CR3T"));
+        assert_eq!(strip_bearer_prefix("Basic s3cr3t"), None);
+        assert_eq!(strip_bearer_prefix("Bearers3cr3t"), None);
+        assert_eq!(strip_bearer_prefix("Bearer"), None);
+        assert_eq!(strip_bearer_prefix(""), None);
     }
 }

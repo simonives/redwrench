@@ -13,6 +13,14 @@ pub struct ExecutionResult {
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// How long to keep draining the stdout/stderr pipes *after* the direct
+/// child has already exited. See the note at the `child.wait()` arm of the
+/// select below: a grandchild holding the inherited pipe open would
+/// otherwise block the read indefinitely, past the caller's own timeout.
+/// Short, because by this point the process is gone and anything still
+/// arriving is a straggler, not the command's real output.
+const POST_EXIT_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn truncate_output(data: Vec<u8>) -> String {
     if data.len() > MAX_OUTPUT_BYTES {
         let truncated = &data[..MAX_OUTPUT_BYTES];
@@ -36,6 +44,12 @@ fn truncate_output(data: Vec<u8>) -> String {
 /// direct child). Every RedWrench tool handler invokes commands
 /// directly (no wrapping shell), so this limitation only applies if a
 /// caller deliberately runs a shell as the target command itself.
+///
+/// Such a grandchild also inherits the stdout/stderr pipe file descriptors,
+/// which is why the post-exit drain is separately bounded by
+/// [`POST_EXIT_READ_TIMEOUT`]: without it, `execute` could return long after
+/// its own `timeout` had passed, holding a server task open for as long as
+/// the grandchild chose to live.
 pub async fn execute(command: &str, args: &[String], timeout: Duration) -> ExecutionResult {
     let mut child = match Command::new(command)
         .args(args)
@@ -80,8 +94,28 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
 
     tokio::select! {
         status = child.wait() => {
-            let stdout_data = stdout_task.await.unwrap_or_default();
-            let stderr_data = stderr_task.await.unwrap_or_default();
+            // NOTE (post-review fix): once `wait()` wins this select, the
+            // outer timeout no longer bounds anything, so awaiting the two
+            // pipe-reader tasks unbounded reintroduced exactly the hang the
+            // timeout exists to prevent. A grandchild that inherited the
+            // stdio file descriptors and outlives the direct child (the
+            // classic `sh -c 'sleep 30 & exit 0'` shape) keeps the write
+            // end of both pipes open, so `read_to_end` blocks until the
+            // grandchild exits, long after the child's exit status has
+            // already been reported. The spec is explicit that a hung
+            // process must not be able to wedge the server, so bound the
+            // post-exit drain with a short secondary timeout and fall back
+            // to whatever was captured (or nothing) if it elapses.
+            let stdout_data = tokio::time::timeout(POST_EXIT_READ_TIMEOUT, stdout_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let stderr_data = tokio::time::timeout(POST_EXIT_READ_TIMEOUT, stderr_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
             match status {
                 Ok(status) => ExecutionResult {
                     exit_code: status.code(),
@@ -167,5 +201,39 @@ mod tests {
         .await;
         assert!(result.stdout.len() <= MAX_OUTPUT_BYTES + 200);
         assert!(result.stdout.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn a_grandchild_holding_the_pipe_open_cannot_hang_execute() {
+        // `sh` exits immediately, but the backgrounded `sleep` inherits
+        // both pipe write ends and lives for 30 seconds. Before the
+        // post-exit read timeout, `read_to_end` blocked for that whole 30
+        // seconds even though the direct child was already reaped, so
+        // `execute` ignored its own timeout entirely.
+        //
+        // The bound is POST_EXIT_READ_TIMEOUT (2s), so this asserts
+        // completion well inside that 30s while still proving the read is
+        // bounded rather than waiting on the grandchild.
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            execute(
+                "sh",
+                &["-c".to_string(), "sleep 30 & exit 0".to_string()],
+                Duration::from_secs(20),
+            ),
+        )
+        .await
+        .expect("execute() hung past the grandchild-safe bound");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "execute() took {:?}, the post-exit drain is not bounded",
+            started.elapsed()
+        );
+        // The direct child really did exit successfully; the timeout is on
+        // the drain, not on the command.
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out);
     }
 }

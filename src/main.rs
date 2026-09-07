@@ -70,8 +70,18 @@ fn update_tier_in_config(
 }
 
 async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
-    if let Err(err) = audit::init_journal_logging() {
-        eprintln!("warning: could not initialise journal logging: {err}");
+    // NOTE (post-review fix, audit must not fail silently): if journald is
+    // unavailable (containers, non-systemd hosts), `init_journal_logging`
+    // previously left NO tracing subscriber installed, which turns every
+    // subsequent audit record and auth-failure warning into a permanent
+    // no-op after one easily-missed startup line. The spec's audit
+    // requirement is unconditional, so we fall back to a stderr subscriber
+    // instead (a systemd unit with `StandardError=journal` still lands
+    // those entries in the journal). We deliberately do not fail hard here:
+    // refusing to start when journald is absent would add a new
+    // denial-of-service surface without making the audit trail any better.
+    if let Err(err) = audit::init_logging() {
+        eprintln!("warning: could not initialise any logging subscriber: {err}");
     }
 
     let config = config::Config::load(&cli.config)?;
@@ -101,7 +111,7 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     let tier_name = format!("{:?}", config.tier).to_lowercase();
     let server = RedWrenchServer::new(
         Arc::new(policy::PolicyEngine::new(config.effective_rules())),
-        Duration::from_secs(30),
+        Duration::from_secs(config.timeout_secs),
         tier_name,
     );
 

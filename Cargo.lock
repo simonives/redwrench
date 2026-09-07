@@ -833,7 +833,6 @@ dependencies = [
  "axum",
  "clap",
  "clap_mangen",
- "libc",
  "regex",
  "rmcp",
  "schemars 0.8.22",

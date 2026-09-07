@@ -1,4 +1,5 @@
 mod audit;
+mod auth;
 mod config;
 mod executor;
 mod policy;

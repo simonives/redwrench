@@ -24,6 +24,7 @@ impl RedWrenchServer {
         Parameters(RunCommandParams { command, args }): Parameters<RunCommandParams>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        self.dispatch("run_command", &command, args, ctx, None).await
+        self.dispatch("run_command", &command, args, ctx, None)
+            .await
     }
 }

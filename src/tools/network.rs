@@ -47,11 +47,9 @@ fn ping_argv(host: String, count: Option<u32>) -> Vec<String> {
 
 #[tool_router(router = network_router, vis = "pub(crate)")]
 impl RedWrenchServer {
-    #[tool(
-        description = "Ping a host to check basic network reachability. Omit \
+    #[tool(description = "Ping a host to check basic network reachability. Omit \
         'count' to ping indefinitely (bounded by the server's safety-net \
-        duration or cancellation). Allowed under every tier."
-    )]
+        duration or cancellation). Allowed under every tier.")]
     pub async fn ping(
         &self,
         Parameters(PingParams { host, count }): Parameters<PingParams>,

@@ -68,8 +68,14 @@ impl RedWrenchServer {
         Parameters(SystemctlStatusParams { unit }): Parameters<SystemctlStatusParams>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        self.dispatch("systemctl_status", "systemctl", status_argv(unit), ctx, None)
-            .await
+        self.dispatch(
+            "systemctl_status",
+            "systemctl",
+            status_argv(unit),
+            ctx,
+            None,
+        )
+        .await
     }
 
     #[tool(

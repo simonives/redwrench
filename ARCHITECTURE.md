@@ -44,7 +44,13 @@ decision.
    `max_stream_duration_secs` config value or cancellation) passes that
    duration (as a `Duration`, `RedWrenchServer.max_stream_duration`) to `dispatch()` as an
    override, see `ping`'s optional `count` and `journalctl_tail`'s `follow`
-   for the pattern.
+   for the pattern. Note that a cancelled call's
+   `CallToolResult::error("Command cancelled by caller")` is a
+   `dispatch()`-level contract the MCP transport layer does not guarantee
+   delivers: rmcp drops a response whose request id has already been
+   removed from the cancellation pool, so the audit log's
+   `decision="cancelled"` entry, not the response, is the durable record
+   that a cancellation happened.
 4. **Execution and audit** (`src/executor.rs`, `src/audit.rs`): the only
    place a process is actually spawned, and the only place a journal
    entry is written. Always argv-based (`tokio::process`), never a

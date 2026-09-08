@@ -82,6 +82,13 @@ tier = "standard"
 # defaults to 30. Raise it if you run `dnf install` over a slow mirror.
 timeout_secs = 120
 
+# The safety net for genuinely indefinite calls (e.g. `ping` with no
+# count, `journalctl_tail` with follow enabled, `vmstat 1` under a
+# progress-token-attached call). Such a call is not bounded by
+# timeout_secs above; it runs until cancelled or until this many
+# seconds have passed. Optional; defaults to 1800 (30 minutes).
+max_stream_duration_secs = 1800
+
 # Custom rules layer on top of the tier and are evaluated FIRST, so a
 # custom deny overrides a tier allow. Matching is first-match-wins.
 # `arg_pattern` is a regex tested against the joined arguments; omit it to

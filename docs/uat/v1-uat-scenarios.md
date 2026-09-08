@@ -143,10 +143,23 @@ argv vectors end-to-end. Run all three:
 2. While it's running, send a cancellation for that request (however the
    connected MCP client exposes this, e.g. a "stop" action on an
    in-progress tool call).
-3. **Expected:** the call ends quickly (well under 30 seconds), the
-   response indicates cancellation (not a timeout, not a success), and
+3. **Expected:** the call ends quickly (well under 30 seconds), and
    `ps`/`pgrep` on the Fedora host confirms the `sleep` process is
    actually gone, not orphaned.
+4. **Expected:** no response is delivered for the cancelled request. This
+   is correct MCP behaviour, not a bug: rmcp removes a cancelled
+   request's entry from its cancellation-token pool when the
+   `notifications/cancelled` arrives, so RedWrench's own
+   "Command cancelled by caller" result finds no entry to send against
+   and is dropped. How the client renders that is the client's business
+   (some show "cancelled", some simply stop waiting), so do not assert
+   anything about what appears in its UI.
+5. Check the journal (`journalctl -t redwrench` or equivalent) for the
+   audit entry covering this call.
+   **Expected:** an entry with `decision="cancelled"`, carrying the same
+   `request_id` as the `"long-running invocation started"` entry for the
+   same call. The audit log, not the response, is the durable record
+   that a cancellation happened.
 
 ## Scenario 12: indefinite ping runs until cancelled or the safety net trips
 
@@ -155,7 +168,10 @@ argv vectors end-to-end. Run all three:
    output (Scenario 10) that successive replies are visible over time,
    not just a final result.
 3. Cancel the call (as in Scenario 11).
-4. **Expected:** ping stops immediately, confirmed via `ps`/`pgrep`.
+4. **Expected:** ping stops immediately, confirmed via `ps`/`pgrep`. As
+   in Scenario 11, no response is delivered for the cancelled request;
+   the journal's `decision="cancelled"` audit entry is the observable
+   record.
 5. Repeat without cancelling, and instead temporarily lower
    `max_stream_duration_secs` in the config to a small value (e.g. 10)
    to make the safety net practical to observe.
@@ -172,7 +188,9 @@ argv vectors end-to-end. Run all three:
    written to the journal, not only the initial `lines` backlog.
 3. Cancel the call.
 4. **Expected:** the call ends and `journalctl -f` for that unit is
-   confirmed via `ps`/`pgrep` to no longer be running.
+   confirmed via `ps`/`pgrep` to no longer be running. As in Scenario 11,
+   no response is delivered for the cancelled request; the journal's
+   `decision="cancelled"` audit entry is the observable record.
 
 ## Scenario 14: monitoring binaries are usable under the safe tier
 

@@ -40,8 +40,9 @@ decision.
    unchanged from a plain buffered call. Cancellation always applies
    regardless of whether streaming was requested, `execute()` selects on it
    alongside its timeout. A tool wanting genuinely indefinite execution
-   (no natural exit, bounded only by the safety-net `max_stream_duration`
-   config value or cancellation) passes that duration to `dispatch()` as an
+   (no natural exit, bounded only by the safety-net
+   `max_stream_duration_secs` config value or cancellation) passes that
+   duration (as a `Duration`, `RedWrenchServer.max_stream_duration`) to `dispatch()` as an
    override, see `ping`'s optional `count` and `journalctl_tail`'s `follow`
    for the pattern.
 4. **Execution and audit** (`src/executor.rs`, `src/audit.rs`): the only

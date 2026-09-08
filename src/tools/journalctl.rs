@@ -12,6 +12,11 @@ pub struct JournalctlTailParams {
     /// How many of the most recent lines to return. Defaults to 50.
     #[serde(default = "default_lines")]
     pub lines: u32,
+    /// If true, keep following the journal after the initial `lines` are
+    /// shown, until the caller cancels the call or the server's
+    /// safety-net duration elapses. Defaults to false.
+    #[serde(default)]
+    pub follow: bool,
 }
 
 fn default_lines() -> u32 {
@@ -68,7 +73,7 @@ fn default_lines() -> u32 {
 // catches every concrete payload this file's tests exercise
 // (`--file=/etc/shadow`, `--directory=/root`, a bare `--`), while no longer
 // rejecting single-dash-escaped unit names like `-.mount`.
-fn journalctl_args(unit: Option<String>, lines: u32) -> Result<Vec<String>, String> {
+fn journalctl_args(unit: Option<String>, lines: u32, follow: bool) -> Result<Vec<String>, String> {
     let mut args = vec![
         "-n".to_string(),
         lines.to_string(),
@@ -85,6 +90,9 @@ fn journalctl_args(unit: Option<String>, lines: u32) -> Result<Vec<String>, Stri
         args.push("-u".to_string());
         args.push(unit);
     }
+    if follow {
+        args.push("-f".to_string());
+    }
     Ok(args)
 }
 
@@ -92,16 +100,35 @@ fn journalctl_args(unit: Option<String>, lines: u32) -> Result<Vec<String>, Stri
 impl RedWrenchServer {
     #[tool(
         description = "Return the most recent lines from the systemd journal, \
-        optionally filtered to a single unit. This is a one-shot read, it does \
-        not follow the log live; live-following is not supported in this \
-        version. Allowed under every tier."
+        optionally filtered to a single unit. Set follow: true to keep \
+        streaming new lines after the initial output, until cancelled or \
+        the server's safety-net duration elapses. Allowed under every tier."
     )]
     pub async fn journalctl_tail(
         &self,
-        Parameters(JournalctlTailParams { unit, lines }): Parameters<JournalctlTailParams>,
+        Parameters(JournalctlTailParams {
+            unit,
+            lines,
+            follow,
+        }): Parameters<JournalctlTailParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        match journalctl_args(unit, lines) {
-            Ok(args) => self.dispatch("journalctl_tail", "journalctl", args).await,
+        match journalctl_args(unit, lines, follow) {
+            Ok(args) => {
+                let max_duration_override = if follow {
+                    Some(self.max_stream_duration)
+                } else {
+                    None
+                };
+                self.dispatch(
+                    "journalctl_tail",
+                    "journalctl",
+                    args,
+                    ctx,
+                    max_duration_override,
+                )
+                .await
+            }
             Err(reason) => CallToolResult::error(vec![ContentBlock::text(reason)]),
         }
     }
@@ -113,25 +140,25 @@ mod tests {
 
     #[test]
     fn plain_lines_only_when_no_unit_is_given() {
-        let args = journalctl_args(None, 50).unwrap();
+        let args = journalctl_args(None, 50, false).unwrap();
         assert_eq!(args, vec!["-n", "50", "--no-pager"]);
     }
 
     #[test]
     fn ordinary_unit_names_are_unaffected() {
-        let args = journalctl_args(Some("sshd.service".to_string()), 50).unwrap();
+        let args = journalctl_args(Some("sshd.service".to_string()), 50, false).unwrap();
         assert_eq!(args, vec!["-n", "50", "--no-pager", "-u", "sshd.service"]);
     }
 
     #[test]
     fn a_unit_value_that_looks_like_a_file_redirect_flag_is_rejected() {
-        let result = journalctl_args(Some("--file=/etc/shadow".to_string()), 50);
+        let result = journalctl_args(Some("--file=/etc/shadow".to_string()), 50, false);
         assert!(result.is_err(), "expected rejection, got {result:?}");
     }
 
     #[test]
     fn a_unit_value_that_looks_like_a_directory_redirect_flag_is_rejected() {
-        let result = journalctl_args(Some("--directory=/root".to_string()), 50);
+        let result = journalctl_args(Some("--directory=/root".to_string()), 50, false);
         assert!(result.is_err(), "expected rejection, got {result:?}");
     }
 
@@ -139,7 +166,7 @@ mod tests {
     fn a_bare_double_dash_unit_value_is_rejected() {
         // A bare "--" is not a legitimate unit name either, and must not be
         // silently absorbed as -u's argument.
-        let result = journalctl_args(Some("--".to_string()), 50);
+        let result = journalctl_args(Some("--".to_string()), 50, false);
         assert!(result.is_err(), "expected rejection, got {result:?}");
     }
 
@@ -150,7 +177,7 @@ mod tests {
         // double dash, and must not be rejected by the "--" long-option
         // guard: someone diagnosing root-filesystem I/O errors with
         // `journalctl -u -.mount` needs this to work.
-        let args = journalctl_args(Some("-.mount".to_string()), 50).unwrap();
+        let args = journalctl_args(Some("-.mount".to_string()), 50, false).unwrap();
         assert_eq!(args, vec!["-n", "50", "--no-pager", "-u", "-.mount"]);
     }
 
@@ -160,7 +187,7 @@ mod tests {
         // guard is specifically anchored on "--" and not just "starts with
         // more than zero dashes".
         for unit in ["-.slice", "-boot.mount"] {
-            let args = journalctl_args(Some(unit.to_string()), 50).unwrap();
+            let args = journalctl_args(Some(unit.to_string()), 50, false).unwrap();
             assert_eq!(args, vec!["-n", "50", "--no-pager", "-u", unit]);
         }
     }
@@ -169,7 +196,28 @@ mod tests {
     fn lines_is_a_plain_integer_and_is_never_treated_as_a_flag() {
         // lines is a u32, already immune to this class of injection; confirm
         // it still lands in the expected fixed position regardless.
-        let args = journalctl_args(None, 9999).unwrap();
+        let args = journalctl_args(None, 9999, false).unwrap();
         assert_eq!(args, vec!["-n", "9999", "--no-pager"]);
+    }
+
+    #[test]
+    fn follow_mode_appends_the_follow_flag() {
+        let args = journalctl_args(None, 50, true).unwrap();
+        assert_eq!(args, vec!["-n", "50", "--no-pager", "-f"]);
+    }
+
+    #[test]
+    fn follow_mode_with_a_unit_still_filters_by_unit() {
+        let args = journalctl_args(Some("sshd.service".to_string()), 50, true).unwrap();
+        assert_eq!(
+            args,
+            vec!["-n", "50", "--no-pager", "-u", "sshd.service", "-f"]
+        );
+    }
+
+    #[test]
+    fn non_follow_mode_is_unchanged() {
+        let args = journalctl_args(None, 50, false).unwrap();
+        assert_eq!(args, vec!["-n", "50", "--no-pager"]);
     }
 }

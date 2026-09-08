@@ -34,20 +34,17 @@ written to the systemd journal, whether it was permitted or refused. Three
 built-in tiers (`safe`, `standard`, `unrestricted`) set the baseline, and
 custom rules layer on top without editing a line of code.
 
-RedWrench is written in Rust. A tool that spawns arbitrary processes,
-reads their output as it arrives, and enforces a policy decision before
-any of that happens needs strict guarantees on memory bounds and
-concurrent state, and Rust's compiler checks both at build time rather
-than leaving them to runtime discipline. That guarantee is the whole
-reason a tool built to run arbitrary commands safely can make that
-claim at all.
+RedWrench is written in Rust. As it's a tool that spawns arbitrary processes,
+reads their output as it arrives, and enforces policy decisions up-front, it needs strict guarantees on memory bounds and
+concurrent state. Rust's compiler checks both at build time rather
+than leaving them to runtime discipline.
 
 Governments have started saying the same thing directly. The NSA and
 the White House's National Cyber Director have both urged vendors to
 move away from memory-unsafe languages like C and C++ toward
 alternatives such as Rust, because so many serious vulnerabilities
-trace back to memory bugs a compiler can catch before the code ever
-ships. That same guarantee matters for an AI agent talking to this
+trace back to memory bugs that a compiler can catch before their code is
+shipped. That same guarantee's important for an AI agent talking to this
 server: the compiler bounds what a single request can touch at build
 time, so a malformed or adversarial instruction from the agent cannot
 corrupt memory outside its own transaction.

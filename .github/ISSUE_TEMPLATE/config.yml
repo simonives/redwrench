@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/simonives/redwrench/security/advisories/new
+    about: Please do not report security vulnerabilities through public GitHub issues, see SECURITY.md.
+  - name: Ask a question / start a discussion
+    url: https://github.com/simonives/redwrench/discussions
+    about: For usage questions or open-ended design discussion rather than a specific bug or feature.

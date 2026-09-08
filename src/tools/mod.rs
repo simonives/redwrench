@@ -82,6 +82,12 @@ impl RedWrenchServer {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
         max_duration_override: Option<Duration>,
     ) -> CallToolResult {
+        // The MCP request id, carried on every audit entry this call writes.
+        // It is what lets an operator pair a "started" line with its
+        // completion line when several long-running calls to the same tool
+        // are in flight at once.
+        let request_id = ctx.id.to_string();
+
         match self.policy.evaluate(command, &args) {
             Decision::Denied(reason) => {
                 crate::audit::record_invocation(
@@ -91,6 +97,7 @@ impl RedWrenchServer {
                     &self.tier_name,
                     "denied",
                     None,
+                    &request_id,
                 );
                 CallToolResult::error(vec![ContentBlock::text(format!(
                     "Denied: {reason} (active tier: {})",
@@ -133,7 +140,18 @@ impl RedWrenchServer {
                 // ever in flight, which is exactly the gap `record_start`
                 // exists to close.
                 if max_duration_override.is_some() || progress_token.is_some() {
-                    crate::audit::record_start(tool, command, &args, &self.tier_name);
+                    crate::audit::record_start(
+                        tool,
+                        command,
+                        &args,
+                        &self.tier_name,
+                        crate::audit::start_reason(
+                            progress_token.is_some(),
+                            max_duration_override.is_some(),
+                        ),
+                        effective_timeout,
+                        &request_id,
+                    );
                 }
 
                 let chunk_sink = progress_token.map(|token| {
@@ -183,6 +201,7 @@ impl RedWrenchServer {
                     &self.tier_name,
                     decision,
                     result.exit_code,
+                    &request_id,
                 );
                 if result.cancelled {
                     CallToolResult::error(vec![ContentBlock::text(

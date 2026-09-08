@@ -47,6 +47,12 @@ pub fn init_logging() -> anyhow::Result<()> {
 /// questions an audit trail exists to answer: which package was installed,
 /// which unit was stopped, what a denied `run_command` actually tried to
 /// run. The spec calls for the *resolved command*, not just the executable.
+///
+/// `request_id` is the MCP request id, carried on both this entry and the
+/// matching [`record_start`] entry. Without it the two lines for one call
+/// cannot be paired: two concurrent `journalctl_tail` calls with `follow`
+/// set against the same unit produce two indistinguishable "started" lines
+/// and, minutes later, two indistinguishable completion lines.
 pub fn record_invocation(
     tool: &str,
     command: &str,
@@ -54,9 +60,11 @@ pub fn record_invocation(
     tier: &str,
     decision: &str,
     exit_code: Option<i32>,
+    request_id: &str,
 ) {
     tracing::info!(
         target: "redwrench::audit",
+        request_id,
         tool,
         command,
         args = %args.join(" "),
@@ -74,13 +82,60 @@ pub fn record_invocation(
 /// `record_invocation` ever logs its completion. Without a "started"
 /// entry, an operator has no record such a call was even in flight until
 /// it eventually ends, possibly tens of minutes later.
-pub fn record_start(tool: &str, command: &str, args: &[String], tier: &str) {
+///
+/// `reason` says *why* this call qualifies (see [`start_reason`]): the
+/// message used to read "streaming invocation started" even for a call that
+/// was merely indefinite with no progress token attached, which is the one
+/// distinction an operator reading this line most wants. `duration` records
+/// the ceiling that actually applies, so the started entry says how long
+/// this call may legitimately run, not just that it began. `request_id`
+/// pairs this entry with its [`record_invocation`] completion line.
+pub fn record_start(
+    tool: &str,
+    command: &str,
+    args: &[String],
+    tier: &str,
+    reason: &str,
+    duration: std::time::Duration,
+    request_id: &str,
+) {
     tracing::info!(
         target: "redwrench::audit",
+        request_id,
         tool,
         command,
         args = %args.join(" "),
         tier,
-        "streaming invocation started"
+        reason,
+        duration = %format!("{duration:?}"),
+        "long-running invocation started"
     );
+}
+
+/// Classifies why a call earned a [`record_start`] entry.
+///
+/// The two triggers are independent: a call may stream (progress token
+/// attached), run past the ordinary timeout (duration override), or both.
+pub fn start_reason(streaming: bool, indefinite: bool) -> &'static str {
+    match (streaming, indefinite) {
+        (true, true) => "streaming+indefinite",
+        (true, false) => "streaming",
+        (false, true) => "indefinite",
+        (false, false) => "none",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_start_reason_names_which_trigger_fired() {
+        // The old fixed message claimed "streaming" for a call that was
+        // merely indefinite. Each combination now gets its own answer.
+        assert_eq!(start_reason(true, false), "streaming");
+        assert_eq!(start_reason(false, true), "indefinite");
+        assert_eq!(start_reason(true, true), "streaming+indefinite");
+        assert_eq!(start_reason(false, false), "none");
+    }
 }

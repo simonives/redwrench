@@ -66,3 +66,21 @@ pub fn record_invocation(
         "tool invocation"
     );
 }
+
+/// Writes an audit entry when a streaming or indefinite call begins.
+///
+/// A call using streaming or the safety-net duration (rather than the
+/// ordinary default timeout) may run for a long time before
+/// `record_invocation` ever logs its completion. Without a "started"
+/// entry, an operator has no record such a call was even in flight until
+/// it eventually ends, possibly tens of minutes later.
+pub fn record_start(tool: &str, command: &str, args: &[String], tier: &str) {
+    tracing::info!(
+        target: "redwrench::audit",
+        tool,
+        command,
+        args = %args.join(" "),
+        tier,
+        "streaming invocation started"
+    );
+}

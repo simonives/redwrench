@@ -14,6 +14,7 @@ pub mod systemctl;
 pub struct RedWrenchServer {
     pub policy: std::sync::Arc<PolicyEngine>,
     pub timeout: Duration,
+    pub max_stream_duration: Duration,
     pub tier_name: String,
     pub tool_router: ToolRouter<Self>,
 }
@@ -30,10 +31,16 @@ pub struct RedWrenchServer {
 // adds a second `impl RedWrenchServer` block with its own `#[tool_router]`
 // (merged into this field with `+`, since `ToolRouter` implements `Add`).
 impl RedWrenchServer {
-    pub fn new(policy: std::sync::Arc<PolicyEngine>, timeout: Duration, tier_name: String) -> Self {
+    pub fn new(
+        policy: std::sync::Arc<PolicyEngine>,
+        timeout: Duration,
+        tier_name: String,
+        max_stream_duration: Duration,
+    ) -> Self {
         Self {
             policy,
             timeout,
+            max_stream_duration,
             tier_name,
             tool_router: Self::run_command_router()
                 + Self::systemctl_router()
@@ -67,7 +74,14 @@ impl RedWrenchServer {
     // no real stdout/exit code to hand back, so it belongs on the same
     // `is_error: true` side as a denial, not lumped in with an actually
     // completed command's real output.
-    pub async fn dispatch(&self, tool: &str, command: &str, args: Vec<String>) -> CallToolResult {
+    pub async fn dispatch(
+        &self,
+        tool: &str,
+        command: &str,
+        args: Vec<String>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        max_duration_override: Option<Duration>,
+    ) -> CallToolResult {
         match self.policy.evaluate(command, &args) {
             Decision::Denied(reason) => {
                 crate::audit::record_invocation(
@@ -84,8 +98,44 @@ impl RedWrenchServer {
                 ))])
             }
             Decision::Allowed => {
-                let result =
-                    crate::executor::execute(command, &args, self.timeout, None, None).await;
+                let effective_timeout = max_duration_override.unwrap_or(self.timeout);
+                let is_streaming_call = max_duration_override.is_some();
+                if is_streaming_call {
+                    crate::audit::record_start(tool, command, &args, &self.tier_name);
+                }
+
+                // NOTE (rmcp API adaptation): the chunk sink only exists when
+                // the caller supplied a progress token in the request's
+                // `_meta`. Without one there is nothing to address a
+                // `notifications/progress` message to, so streaming is simply
+                // off and `execute()` buffers as before.
+                let progress_token = ctx.meta.get_progress_token();
+                let chunk_sink = progress_token.map(|token| {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let peer = ctx.peer.clone();
+                    let mut progress_count: f64 = 0.0;
+                    tokio::spawn(async move {
+                        while let Some(chunk) = rx.recv().await {
+                            progress_count += 1.0;
+                            let param = rmcp::model::ProgressNotificationParam::new(
+                                token.clone(),
+                                progress_count,
+                            )
+                            .with_message(chunk);
+                            let _ = peer.notify_progress(param).await;
+                        }
+                    });
+                    tx
+                });
+
+                let result = crate::executor::execute(
+                    command,
+                    &args,
+                    effective_timeout,
+                    Some(ctx.ct.clone()),
+                    chunk_sink,
+                )
+                .await;
                 crate::audit::record_invocation(
                     tool,
                     command,
@@ -94,10 +144,13 @@ impl RedWrenchServer {
                     "allowed",
                     result.exit_code,
                 );
-                if result.timed_out {
+                if result.cancelled {
+                    CallToolResult::error(vec![ContentBlock::text(
+                        "Command cancelled by caller".to_string(),
+                    )])
+                } else if result.timed_out {
                     CallToolResult::error(vec![ContentBlock::text(format!(
-                        "Command timed out after {:?}",
-                        self.timeout
+                        "Command timed out after {effective_timeout:?}"
                     ))])
                 } else {
                     CallToolResult::success(vec![ContentBlock::text(format!(
@@ -114,9 +167,12 @@ impl RedWrenchServer {
 impl ServerHandler for RedWrenchServer {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::policy::{Effect, Rule};
+
+    use rmcp::service::{serve_directly, RequestContext, RunningService};
+    use rmcp::RoleServer;
 
     fn allow_all_server(timeout: Duration) -> RedWrenchServer {
         RedWrenchServer::new(
@@ -127,6 +183,7 @@ mod tests {
             }])),
             timeout,
             "unrestricted".to_string(),
+            Duration::from_secs(1800),
         )
     }
 
@@ -135,7 +192,33 @@ mod tests {
             std::sync::Arc::new(PolicyEngine::new(vec![])),
             timeout,
             "safe".to_string(),
+            Duration::from_secs(1800),
         )
+    }
+
+    /// Builds a real `RequestContext<RoleServer>` for `dispatch()`'s tests.
+    ///
+    /// NOTE (rmcp API adaptation): `RequestContext::new` is public, but
+    /// `Peer::new` is `pub(crate)` in rmcp 3.2.0, so a peer cannot be
+    /// conjured directly from outside the crate. The public route to one is
+    /// `serve_directly`, which skips the initialize handshake and hands back
+    /// a `RunningService` whose `.peer()` is the `Peer<RoleServer>` we need.
+    /// The returned `RunningService` is the guard that keeps that peer's
+    /// channel alive, so callers must bind it for the duration of the test.
+    pub(crate) fn test_request_context(
+        server: &RedWrenchServer,
+    ) -> (
+        RequestContext<RoleServer>,
+        RunningService<RoleServer, RedWrenchServer>,
+    ) {
+        let (server_transport, _client_transport) = tokio::io::duplex(4096);
+        let running =
+            serve_directly::<RoleServer, _, _, _, _>(server.clone(), server_transport, None);
+        let ctx = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            running.peer().clone(),
+        );
+        (ctx, running)
     }
 
     fn text_of(result: &CallToolResult) -> String {
@@ -151,11 +234,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_a_structured_error_result_when_the_policy_denies() {
         let server = deny_all_server(Duration::from_secs(5));
+        let (ctx, _guard) = test_request_context(&server);
         let result = server
             .dispatch(
                 "run_command",
                 "rm",
                 vec!["-rf".to_string(), "/".to_string()],
+                ctx,
+                None,
             )
             .await;
 
@@ -171,8 +257,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_a_successful_result_with_real_output_when_the_policy_allows() {
         let server = allow_all_server(Duration::from_secs(5));
+        let (ctx, _guard) = test_request_context(&server);
         let result = server
-            .dispatch("run_command", "echo", vec!["hello".to_string()])
+            .dispatch("run_command", "echo", vec!["hello".to_string()], ctx, None)
             .await;
 
         assert_eq!(result.is_error, Some(false));
@@ -187,8 +274,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_reports_a_timeout_as_a_structured_error_result() {
         let server = allow_all_server(Duration::from_millis(100));
+        let (ctx, _guard) = test_request_context(&server);
         let result = server
-            .dispatch("run_command", "sleep", vec!["5".to_string()])
+            .dispatch("run_command", "sleep", vec!["5".to_string()], ctx, None)
             .await;
 
         // A timeout produced no real output, so from the calling agent's
@@ -198,5 +286,38 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
         assert!(text.contains("timed out"), "unexpected text: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_reports_cancellation_as_a_structured_error_result() {
+        let server = allow_all_server(Duration::from_secs(60));
+        let (ctx, _guard) = test_request_context(&server);
+        ctx.ct.cancel();
+        let result = server
+            .dispatch("run_command", "sleep", vec!["30".to_string()], ctx, None)
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
+        assert!(text.contains("cancelled"), "unexpected text: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_duration_override_is_used_instead_of_the_default_timeout() {
+        // A short default timeout would normally kill this in 100ms; the
+        // override lets a streaming/follow call run for up to 5s instead.
+        let server = allow_all_server(Duration::from_millis(100));
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "ping",
+                "sleep",
+                vec!["1".to_string()],
+                ctx,
+                Some(Duration::from_secs(5)),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        assert!(!text_of(&result).is_empty());
     }
 }

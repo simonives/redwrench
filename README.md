@@ -3,10 +3,20 @@
 [![CI](https://github.com/simonives/redwrench/actions/workflows/ci.yml/badge.svg)](https://github.com/simonives/redwrench/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-An AI coding agent that can run arbitrary commands on your machine is a
-liability the moment it's wrong about one of them. RedWrench gives an
-agent a separate Fedora box to work on instead, gated by a policy engine
-that decides what it may run before it runs, not after.
+I keep a handful of old machines running Fedora at home, the kind of
+hardware that's not worth much anymore but still works fine as a home
+server or a tinkering box. I wanted to point an AI coding agent at them,
+ask it to manage a service or debug a config, without ever handing that
+agent a shell on the workstation I actually do my work on. RedWrench is
+the result: a small Rust server that exposes one Fedora machine to an
+agent over MCP (Model Context Protocol), a standard now supported by
+Claude Code, Codex, and most other agents, gated by a policy engine that
+decides what the agent may run before it runs it, not after. It's a
+personal hobby project built to solve my own problem, not a professional
+or commercial release, and I'm publishing it because the problem (an
+agent that can run anything is a liability, an agent confined to a box
+you can afford to lose is not) is one plenty of people with a spare
+Fedora machine will also have.
 
 It is a native, security-conscious MCP (Model Context Protocol) server
 that exposes hardware and OS control on a dedicated Fedora machine to AI

@@ -3,25 +3,51 @@
 [![CI](https://github.com/simonives/redwrench/actions/workflows/ci.yml/badge.svg)](https://github.com/simonives/redwrench/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-An AI coding agent that can run arbitrary commands on your machine is a
-liability the moment it's wrong about one of them. RedWrench gives an
-agent a separate Fedora box to work on instead, gated by a policy engine
-that decides what it may run before it runs, not after.
+I keep a few old machines at home running Fedora, and the hardware's
+too outdated to sell but still fine as a home server or something to
+tinker with. I wanted an AI coding agent to look after them for me:
+simple things like restarting a service, chasing down a bad config, or
+running the odd diagnostic. And some more complex things too, like
+installing a package I've decided I want, or working out why a service
+refuses to start after a kernel update. However I didn't want to hand
+the agents a shell on these machines.
 
-It is a native, security-conscious MCP (Model Context Protocol) server
-that exposes hardware and OS control on a dedicated Fedora machine to AI
-coding agents (Claude Code, Codex, Google Antigravity, and similar)
-running elsewhere on the network. An agent operates a physically or
-logically separate Fedora box, standard or immutable, KDE or GNOME or
-Server, without installing agent tooling on that box and without exposing
-your main workstation to full-exec risk.
+RedWrench is what I built instead. It runs on the Fedora box itself and
+uses [MCP (Model Context Protocol)](https://modelcontextprotocol.io/),
+the standard Claude Code, Codex, and most other coding agents already
+support. Every command the agents send passes through a policy engine
+first, which decides what they may run before it runs anything at all.
+
+This is a hobby project. I built it to scratch my own itch on my own
+hardware, and I'm publishing it because anyone else running similar
+machines at home will hit the same problem the moment they point an
+agent at them.
+
+Any MCP-speaking agent works: Claude Code, Codex, Google Antigravity, and
+whatever comes next. The Fedora box itself can be physically or
+logically separate from your workstation, standard or immutable, KDE,
+GNOME, or Server, and it needs no agent tooling installed on it
+directly.
 
 Every invocation passes through an ordered allow/deny policy engine and is
 written to the systemd journal, whether it was permitted or refused. Three
 built-in tiers (`safe`, `standard`, `unrestricted`) set the baseline, and
 custom rules layer on top without editing a line of code.
 
-Design spec: `docs/superpowers/specs/2026-09-07-redwrench-design.md`
+RedWrench is written in Rust. As it's a tool that spawns arbitrary processes,
+reads their output as it arrives, and enforces policy decisions up-front, it needs strict guarantees on memory bounds and
+concurrent state. Rust's compiler checks both at build time rather
+than leaving them to runtime discipline.
+
+Governments have started saying the same thing directly. The NSA and
+the White House's National Cyber Director have both urged vendors to
+move away from memory-unsafe languages like C and C++ toward
+alternatives such as Rust, because so many serious vulnerabilities
+trace back to memory bugs that a compiler can catch before their code is
+shipped. That same guarantee's important for an AI agent talking to this
+server: the compiler bounds what a single request can touch at build
+time, so a malformed or adversarial instruction from the agent cannot
+corrupt memory outside its own transaction.
 
 ## Contents
 
@@ -149,6 +175,8 @@ tool has no business being reachable from the open internet by accident.
 - `CONTRIBUTING.md`, development workflow, the two-machine setup, and what
   a change is expected to come with.
 - `AGENTS.md`, orientation for an AI agent picking up this codebase cold.
+- `docs/superpowers/specs/2026-09-07-redwrench-design.md`, the original
+  design spec.
 
 ## License
 

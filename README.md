@@ -3,28 +3,30 @@
 [![CI](https://github.com/simonives/redwrench/actions/workflows/ci.yml/badge.svg)](https://github.com/simonives/redwrench/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-I keep a handful of old machines running Fedora at home, the kind of
-hardware that's not worth much anymore but still works fine as a home
-server or a tinkering box. I wanted to point an AI coding agent at them,
-ask it to manage a service or debug a config, without ever handing that
-agent a shell on the workstation I actually do my work on. RedWrench is
-the result: a small Rust server that exposes one Fedora machine to an
-agent over MCP (Model Context Protocol), a standard now supported by
-Claude Code, Codex, and most other agents, gated by a policy engine that
-decides what the agent may run before it runs it, not after. It's a
-personal hobby project built to solve my own problem, not a professional
-or commercial release, and I'm publishing it because the problem (an
-agent that can run anything is a liability, an agent confined to a box
-you can afford to lose is not) is one plenty of people with a spare
-Fedora machine will also have.
+I keep a few old machines at home running Fedora, hardware too outdated
+to sell but still fine as a home server or something to tinker with. I
+wanted an AI coding agent to look after them for me: restart a service,
+chase down a bad config, run the odd diagnostic. I did not want to hand
+that same agent a shell on the machine I actually work from every day.
 
-It is a native, security-conscious MCP (Model Context Protocol) server
-that exposes hardware and OS control on a dedicated Fedora machine to AI
-coding agents (Claude Code, Codex, Google Antigravity, and similar)
-running elsewhere on the network. An agent operates a physically or
-logically separate Fedora box, standard or immutable, KDE or GNOME or
-Server, without installing agent tooling on that box and without exposing
-your main workstation to full-exec risk.
+RedWrench is what I built instead. It runs on the Fedora box itself and
+speaks MCP (Model Context Protocol), the standard Claude Code, Codex,
+and most other coding agents already support. Every command the agent
+sends passes through a policy engine first, which decides what it may
+run before it runs anything at all. If the agent gets something wrong,
+the cost is a machine I can wipe and reinstall, not the one I do my real
+work on.
+
+This is a hobby project. I built it to scratch my own itch on my own
+hardware, and I'm publishing it because anyone else running old Fedora
+boxes at home will hit the same problem the moment they point an agent
+at one.
+
+Any MCP-speaking agent works: Claude Code, Codex, Google Antigravity, and
+whatever comes next. The Fedora box itself can be physically or
+logically separate from your workstation, standard or immutable, KDE,
+GNOME, or Server, and it needs no agent tooling installed on it
+directly.
 
 Every invocation passes through an ordered allow/deny policy engine and is
 written to the systemd journal, whether it was permitted or refused. Three

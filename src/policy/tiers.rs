@@ -173,6 +173,13 @@ const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
 /// matching a unit name or grep pattern containing the same letters.
 const JOURNALCTL_MUTATION_FLAGS: &str = r"vacuum|--rot|--fl|--syn|--rel|--sm|--set";
 
+/// `sar`'s `-o <file>` writes its binary sample data to an arbitrary
+/// path, an arbitrary-file-write primitive wrapped in a monitoring tool
+/// that is otherwise entirely read-only. Denied before the broad allow,
+/// same first-match-wins pattern as the other tier-level hardening in
+/// this file.
+const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o\b";
+
 fn safe_rules() -> Vec<Rule> {
     vec![
         deny("systemctl", SYSTEMCTL_HOST_REDIRECT_FLAGS),
@@ -187,6 +194,17 @@ fn safe_rules() -> Vec<Rule> {
             "ip",
             Some(r"^(addr|route|link)(\s+(show|list|get)(\s.*)?)?$"),
         ),
+        // Read-only resource monitoring, safe to run indefinitely under
+        // the `safe` tier: none of these mutate system state. `top`
+        // requires `-b` (batch mode), interactive top would hang as a
+        // non-interactive tool call rather than behave sensibly. `sar`'s
+        // `-o` (write raw sample data to an arbitrary path) is denied
+        // before the broad allow, the same deny-before-allow pattern
+        // used for ping/dnf/journalctl elsewhere in this file.
+        allow("vmstat", None),
+        deny("sar", SAR_FILE_OUTPUT_FLAG),
+        allow("sar", None),
+        allow("top", Some(r"^-b")),
     ]
 }
 
@@ -672,6 +690,47 @@ mod tests {
         assert!(matches!(
             engine.evaluate("journalctl", &["--setup-keys".into()]),
             Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_allows_vmstat_for_monitoring() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate("vmstat", &["1".into()]),
+            Decision::Allowed
+        ));
+    }
+
+    #[test]
+    fn safe_tier_allows_batch_mode_top_but_not_interactive_top() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate("top", &["-b".into(), "-n".into(), "1".into()]),
+            Decision::Allowed
+        ));
+        assert!(matches!(engine.evaluate("top", &[]), Decision::Denied(_)));
+    }
+
+    #[test]
+    fn safe_tier_allows_sar_but_denies_its_file_output_flag() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate("sar", &["1".into(), "10".into()]),
+            Decision::Allowed
+        ));
+        assert!(matches!(
+            engine.evaluate("sar", &["-o".into(), "/tmp/evil.dat".into(), "1".into()]),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn the_monitoring_allow_rules_are_inherited_by_the_standard_tier() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        assert!(matches!(
+            engine.evaluate("vmstat", &["1".into()]),
+            Decision::Allowed
         ));
     }
 

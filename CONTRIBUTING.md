@@ -5,6 +5,11 @@
 Read `ARCHITECTURE.md` first, it's short and explains the four layers
 and where new code belongs.
 
+By participating in this project, you agree to abide by the
+[Code of Conduct](CODE_OF_CONDUCT.md). Found a security vulnerability
+rather than an ordinary bug? See [SECURITY.md](SECURITY.md), don't open
+a public issue for it.
+
 ## Development environment
 
 RedWrench wraps Linux-specific facilities (`systemctl`, `dnf`,

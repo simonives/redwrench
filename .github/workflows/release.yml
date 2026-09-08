@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: dnf install -y cargo rust systemd-devel gcc pkgconf-pkg-config git
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "fedora-container-release"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run the test suite before shipping anything
+        run: cargo test --workspace --locked
+
+      - name: Package binary and man page
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/redwrench dist/redwrench
+          man_page=$(find target/release/build -name 'redwrench.1' -path '*/out/*' | head -n1)
+          if [ -z "$man_page" ]; then
+            echo "man page not found under target/release/build" >&2
+            exit 1
+          fi
+          cp "$man_page" dist/redwrench.1
+          tar -C dist -czf "redwrench-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" redwrench redwrench.1
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: redwrench-*-x86_64-linux.tar.gz
+          generate_release_notes: true
+          # v0.x tags are pre-1.0, marked as such on the release page rather
+          # than silently implying a stability guarantee this project isn't
+          # making yet.
+          prerelease: ${{ startsWith(github.ref_name, 'v0.') }}

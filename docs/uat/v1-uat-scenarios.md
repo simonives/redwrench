@@ -118,3 +118,91 @@ argv vectors end-to-end. Run all three:
    timing from a normal single ping. If in doubt, watch outbound ICMP
    traffic (e.g. `tcpdump icmp` or equivalent) during the call and
    confirm it shows a single echo request rather than a rapid burst.
+
+## Scenario 10: streaming output reaches the client live
+
+1. Connect to a running `redwrench` instance from an MCP client that
+   supports progress notifications (confirm which of Claude Code or
+   Antigravity actually surfaces `notifications/progress` to the user,
+   this is genuinely unverified against a real client as of this
+   scenario being written).
+2. Call `dnf_install` (or another command that takes several seconds)
+   under the `standard` tier, with the client attaching a progress
+   token.
+3. **Expected:** output appears incrementally as the command runs, not
+   as a single block only after it finishes.
+4. Repeat the same call from a client that does NOT attach a progress
+   token (or via a raw request with no `_meta.progressToken`).
+5. **Expected:** behaviour is identical to pre-streaming RedWrench, one
+   buffered result at the end, no partial output, no regression.
+
+## Scenario 11: cancellation actually stops a running command
+
+1. Call `run_command` with a long-running command (e.g. `sleep 30`)
+   under a tier that allows it.
+2. While it's running, send a cancellation for that request (however the
+   connected MCP client exposes this, e.g. a "stop" action on an
+   in-progress tool call).
+3. **Expected:** the call ends quickly (well under 30 seconds), and
+   `ps`/`pgrep` on the Fedora host confirms the `sleep` process is
+   actually gone, not orphaned.
+4. **Expected:** no response is delivered for the cancelled request. This
+   is correct MCP behaviour, not a bug: rmcp removes a cancelled
+   request's entry from its cancellation-token pool when the
+   `notifications/cancelled` arrives, so RedWrench's own
+   "Command cancelled by caller" result finds no entry to send against
+   and is dropped. How the client renders that is the client's business
+   (some show "cancelled", some simply stop waiting), so do not assert
+   anything about what appears in its UI.
+5. Check the journal (`journalctl -t redwrench` or equivalent) for the
+   audit entry covering this call.
+   **Expected:** an entry with `decision="cancelled"`, carrying the same
+   `request_id` as the `"long-running invocation started"` entry for the
+   same call. The audit log, not the response, is the durable record
+   that a cancellation happened.
+
+## Scenario 12: indefinite ping runs until cancelled or the safety net trips
+
+1. Call `ping` with `host` set but `count` omitted.
+2. **Expected:** the ping runs continuously; confirm via the streamed
+   output (Scenario 10) that successive replies are visible over time,
+   not just a final result.
+3. Cancel the call (as in Scenario 11).
+4. **Expected:** ping stops immediately, confirmed via `ps`/`pgrep`. As
+   in Scenario 11, no response is delivered for the cancelled request;
+   the journal's `decision="cancelled"` audit entry is the observable
+   record.
+5. Repeat without cancelling, and instead temporarily lower
+   `max_stream_duration_secs` in the config to a small value (e.g. 10)
+   to make the safety net practical to observe.
+6. **Expected:** the call is killed once that duration elapses even
+   though nobody cancelled it, confirming the safety net is not
+   optional.
+
+## Scenario 13: journalctl follow mode streams new log lines
+
+1. Call `journalctl_tail` with `follow: true` against a unit that's
+   actively logging (or trigger some activity on a chosen unit while the
+   call is in flight).
+2. **Expected:** new log lines appear in the streamed output as they're
+   written to the journal, not only the initial `lines` backlog.
+3. Cancel the call.
+4. **Expected:** the call ends and `journalctl -f` for that unit is
+   confirmed via `ps`/`pgrep` to no longer be running. As in Scenario 11,
+   no response is delivered for the cancelled request; the journal's
+   `decision="cancelled"` audit entry is the observable record.
+
+## Scenario 14: monitoring binaries are usable under the safe tier
+
+1. With `tier = "safe"`, call `run_command` with `vmstat 1`.
+   **Expected:** allowed, runs, produces output (streamed if a progress
+   token is attached, per Scenario 10).
+2. Call `run_command` with `top -b -n 1`.
+   **Expected:** allowed.
+3. Call `run_command` with `top` (no `-b`, interactive mode).
+   **Expected:** denied by policy (interactive top would hang as a
+   non-interactive call).
+4. Call `run_command` with `sar 1 5`.
+   **Expected:** allowed.
+5. Call `run_command` with `sar -o /tmp/evil.dat 1 5`.
+   **Expected:** denied, the `-o` file-output flag is blocked.

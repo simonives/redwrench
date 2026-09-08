@@ -29,6 +29,28 @@ decision.
    without parsing text. If you add a new failure path to `dispatch`,
    give it the same treatment, an `is_error: false` result should mean
    the command actually ran and produced real output.
+
+   `dispatch()` also owns streaming and cancellation. It extracts each
+   request's `RequestContext` (which `rmcp` populates with a per-request
+   `CancellationToken` that fires automatically on a client's
+   `notifications/cancelled`, and a `Peer` handle for sending
+   `notifications/progress`). If the incoming request carried a progress
+   token, `dispatch()` forwards each output chunk from the executor as a
+   progress message while the command runs; if it didn't, behaviour is
+   unchanged from a plain buffered call. Cancellation always applies
+   regardless of whether streaming was requested, `execute()` selects on it
+   alongside its timeout. A tool wanting genuinely indefinite execution
+   (no natural exit, bounded only by the safety-net
+   `max_stream_duration_secs` config value or cancellation) passes that
+   duration (as a `Duration`, `RedWrenchServer.max_stream_duration`) to `dispatch()` as an
+   override, see `ping`'s optional `count` and `journalctl_tail`'s `follow`
+   for the pattern. Note that a cancelled call's
+   `CallToolResult::error("Command cancelled by caller")` is a
+   `dispatch()`-level contract the MCP transport layer does not guarantee
+   delivers: rmcp drops a response whose request id has already been
+   removed from the cancellation pool, so the audit log's
+   `decision="cancelled"` entry, not the response, is the durable record
+   that a cancellation happened.
 4. **Execution and audit** (`src/executor.rs`, `src/audit.rs`): the only
    place a process is actually spawned, and the only place a journal
    entry is written. Always argv-based (`tokio::process`), never a

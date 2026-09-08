@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 rmcp = { version = "3.0", features = ["server", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.7"
 tower = { version = "0.4", features = ["util"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -36,3 +37,10 @@ clap_mangen = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the streaming test in `src/tools/mod.rs` reads the raw
+# newline-delimited JSON-RPC frames off the client half of the duplex
+# transport, so it needs to inspect the wire form of a
+# `notifications/progress` message directly rather than through a typed
+# struct (asserting `total` is genuinely absent from the JSON, not merely
+# `None` after deserialisation). Already in the lock file via rmcp.
+serde_json = "1"

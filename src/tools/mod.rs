@@ -14,6 +14,7 @@ pub mod systemctl;
 pub struct RedWrenchServer {
     pub policy: std::sync::Arc<PolicyEngine>,
     pub timeout: Duration,
+    pub max_stream_duration: Duration,
     pub tier_name: String,
     pub tool_router: ToolRouter<Self>,
 }
@@ -30,10 +31,16 @@ pub struct RedWrenchServer {
 // adds a second `impl RedWrenchServer` block with its own `#[tool_router]`
 // (merged into this field with `+`, since `ToolRouter` implements `Add`).
 impl RedWrenchServer {
-    pub fn new(policy: std::sync::Arc<PolicyEngine>, timeout: Duration, tier_name: String) -> Self {
+    pub fn new(
+        policy: std::sync::Arc<PolicyEngine>,
+        timeout: Duration,
+        tier_name: String,
+        max_stream_duration: Duration,
+    ) -> Self {
         Self {
             policy,
             timeout,
+            max_stream_duration,
             tier_name,
             tool_router: Self::run_command_router()
                 + Self::systemctl_router()
@@ -67,7 +74,20 @@ impl RedWrenchServer {
     // no real stdout/exit code to hand back, so it belongs on the same
     // `is_error: true` side as a denial, not lumped in with an actually
     // completed command's real output.
-    pub async fn dispatch(&self, tool: &str, command: &str, args: Vec<String>) -> CallToolResult {
+    pub async fn dispatch(
+        &self,
+        tool: &str,
+        command: &str,
+        args: Vec<String>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+        max_duration_override: Option<Duration>,
+    ) -> CallToolResult {
+        // The MCP request id, carried on every audit entry this call writes.
+        // It is what lets an operator pair a "started" line with its
+        // completion line when several long-running calls to the same tool
+        // are in flight at once.
+        let request_id = ctx.id.to_string();
+
         match self.policy.evaluate(command, &args) {
             Decision::Denied(reason) => {
                 crate::audit::record_invocation(
@@ -77,6 +97,7 @@ impl RedWrenchServer {
                     &self.tier_name,
                     "denied",
                     None,
+                    &request_id,
                 );
                 CallToolResult::error(vec![ContentBlock::text(format!(
                     "Denied: {reason} (active tier: {})",
@@ -84,19 +105,111 @@ impl RedWrenchServer {
                 ))])
             }
             Decision::Allowed => {
-                let result = crate::executor::execute(command, &args, self.timeout).await;
+                // NOTE (rmcp API adaptation): the chunk sink only exists when
+                // the caller supplied a progress token in the request's
+                // `_meta`. Without one there is nothing to address a
+                // `notifications/progress` message to, so streaming is simply
+                // off and `execute()` buffers as before.
+                let progress_token = ctx.meta.get_progress_token();
+
+                // An explicit override always wins. Failing that, a caller
+                // that attached a progress token has declared it can consume
+                // a long-running stream, so the ceiling escalates to the
+                // safety net rather than the ordinary timeout. Without this,
+                // `run_command vmstat 1` (or `top -b`, or `ping` driven
+                // through `run_command`) could never actually stream: it
+                // passes no override, so it was permanently capped at
+                // `self.timeout` no matter what the caller asked for. A
+                // caller that sent no progress token still gets `self.timeout`
+                // exactly as before.
+                let effective_timeout = max_duration_override.unwrap_or_else(|| {
+                    if progress_token.is_some() {
+                        self.max_stream_duration
+                    } else {
+                        self.timeout
+                    }
+                });
+
+                // A "started" audit entry is owed for two independent
+                // reasons, so the gate tests for both. A call carrying a
+                // duration override may run far past the ordinary timeout
+                // before `record_invocation` ever logs its completion, and a
+                // call carrying a progress token is streaming live output to
+                // the caller right now. Gating on the override alone would
+                // leave a bounded-but-streaming call with no record it was
+                // ever in flight, which is exactly the gap `record_start`
+                // exists to close.
+                if max_duration_override.is_some() || progress_token.is_some() {
+                    crate::audit::record_start(
+                        tool,
+                        command,
+                        &args,
+                        &self.tier_name,
+                        crate::audit::start_reason(
+                            progress_token.is_some(),
+                            max_duration_override.is_some(),
+                        ),
+                        effective_timeout,
+                        &request_id,
+                    );
+                }
+
+                let chunk_sink = progress_token.map(|token| {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let peer = ctx.peer.clone();
+                    let mut progress_count: f64 = 0.0;
+                    tokio::spawn(async move {
+                        while let Some(chunk) = rx.recv().await {
+                            progress_count += 1.0;
+                            let param = rmcp::model::ProgressNotificationParam::new(
+                                token.clone(),
+                                progress_count,
+                            )
+                            .with_message(chunk);
+                            let _ = peer.notify_progress(param).await;
+                        }
+                    });
+                    tx
+                });
+
+                let result = crate::executor::execute(
+                    command,
+                    &args,
+                    effective_timeout,
+                    Some(ctx.ct.clone()),
+                    chunk_sink,
+                )
+                .await;
+
+                // The spec puts the audit log, not the MCP response, in
+                // charge of preserving the difference between a call that
+                // timed out and one the caller cancelled. Both surface an
+                // `exit_code` of `None`, so a fixed "allowed" decision string
+                // would collapse them into one indistinguishable audit event.
+                // The decision field carries the real outcome instead.
+                let decision = if result.cancelled {
+                    "cancelled"
+                } else if result.timed_out {
+                    "timed_out"
+                } else {
+                    "allowed"
+                };
                 crate::audit::record_invocation(
                     tool,
                     command,
                     &args,
                     &self.tier_name,
-                    "allowed",
+                    decision,
                     result.exit_code,
+                    &request_id,
                 );
-                if result.timed_out {
+                if result.cancelled {
+                    CallToolResult::error(vec![ContentBlock::text(
+                        "Command cancelled by caller".to_string(),
+                    )])
+                } else if result.timed_out {
                     CallToolResult::error(vec![ContentBlock::text(format!(
-                        "Command timed out after {:?}",
-                        self.timeout
+                        "Command timed out after {effective_timeout:?}"
                     ))])
                 } else {
                     CallToolResult::success(vec![ContentBlock::text(format!(
@@ -113,9 +226,12 @@ impl RedWrenchServer {
 impl ServerHandler for RedWrenchServer {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::policy::{Effect, Rule};
+
+    use rmcp::service::{serve_directly, RequestContext, RunningService};
+    use rmcp::RoleServer;
 
     fn allow_all_server(timeout: Duration) -> RedWrenchServer {
         RedWrenchServer::new(
@@ -126,6 +242,7 @@ mod tests {
             }])),
             timeout,
             "unrestricted".to_string(),
+            Duration::from_secs(1800),
         )
     }
 
@@ -134,7 +251,33 @@ mod tests {
             std::sync::Arc::new(PolicyEngine::new(vec![])),
             timeout,
             "safe".to_string(),
+            Duration::from_secs(1800),
         )
+    }
+
+    /// Builds a real `RequestContext<RoleServer>` for `dispatch()`'s tests.
+    ///
+    /// NOTE (rmcp API adaptation): `RequestContext::new` is public, but
+    /// `Peer::new` is `pub(crate)` in rmcp 3.2.0, so a peer cannot be
+    /// conjured directly from outside the crate. The public route to one is
+    /// `serve_directly`, which skips the initialize handshake and hands back
+    /// a `RunningService` whose `.peer()` is the `Peer<RoleServer>` we need.
+    /// The returned `RunningService` is the guard that keeps that peer's
+    /// channel alive, so callers must bind it for the duration of the test.
+    pub(crate) fn test_request_context(
+        server: &RedWrenchServer,
+    ) -> (
+        RequestContext<RoleServer>,
+        RunningService<RoleServer, RedWrenchServer>,
+    ) {
+        let (server_transport, _client_transport) = tokio::io::duplex(4096);
+        let running =
+            serve_directly::<RoleServer, _, _, _, _>(server.clone(), server_transport, None);
+        let ctx = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            running.peer().clone(),
+        );
+        (ctx, running)
     }
 
     fn text_of(result: &CallToolResult) -> String {
@@ -150,11 +293,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_a_structured_error_result_when_the_policy_denies() {
         let server = deny_all_server(Duration::from_secs(5));
+        let (ctx, _guard) = test_request_context(&server);
         let result = server
             .dispatch(
                 "run_command",
                 "rm",
                 vec!["-rf".to_string(), "/".to_string()],
+                ctx,
+                None,
             )
             .await;
 
@@ -170,8 +316,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_a_successful_result_with_real_output_when_the_policy_allows() {
         let server = allow_all_server(Duration::from_secs(5));
+        let (ctx, _guard) = test_request_context(&server);
         let result = server
-            .dispatch("run_command", "echo", vec!["hello".to_string()])
+            .dispatch("run_command", "echo", vec!["hello".to_string()], ctx, None)
             .await;
 
         assert_eq!(result.is_error, Some(false));
@@ -186,8 +333,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_reports_a_timeout_as_a_structured_error_result() {
         let server = allow_all_server(Duration::from_millis(100));
+        let (ctx, _guard) = test_request_context(&server);
         let result = server
-            .dispatch("run_command", "sleep", vec!["5".to_string()])
+            .dispatch("run_command", "sleep", vec!["5".to_string()], ctx, None)
             .await;
 
         // A timeout produced no real output, so from the calling agent's
@@ -197,5 +345,285 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = text_of(&result);
         assert!(text.contains("timed out"), "unexpected text: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_reports_cancellation_as_a_structured_error_result() {
+        let server = allow_all_server(Duration::from_secs(60));
+        let (ctx, _guard) = test_request_context(&server);
+        ctx.ct.cancel();
+        let result = server
+            .dispatch("run_command", "sleep", vec!["30".to_string()], ctx, None)
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
+        assert!(text.contains("cancelled"), "unexpected text: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_duration_override_is_used_instead_of_the_default_timeout() {
+        // A short default timeout would normally kill this in 100ms; the
+        // override lets a streaming/follow call run for up to 5s instead.
+        let server = allow_all_server(Duration::from_millis(100));
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "ping",
+                "sleep",
+                vec!["1".to_string()],
+                ctx,
+                Some(Duration::from_secs(5)),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        assert!(!text_of(&result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_attached_progress_token_escalates_the_ceiling_to_the_safety_net() {
+        // No `max_duration_override`, so before this fix the call was capped
+        // at `self.timeout` (100ms here) and `run_command` could never reach
+        // indefinite execution however the caller asked. Attaching a progress
+        // token is the caller declaring it can consume a long stream, so the
+        // ceiling becomes `max_stream_duration` (1800s from
+        // `allow_all_server`) instead, and a 300ms command completes.
+        let server = allow_all_server(Duration::from_millis(100));
+        let (server_transport, _client_transport) = tokio::io::duplex(64 * 1024);
+        let _running =
+            serve_directly::<RoleServer, _, _, _, _>(server.clone(), server_transport, None);
+        let mut ctx = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            _running.peer().clone(),
+        );
+        ctx.meta.set_progress_token(rmcp::model::ProgressToken(
+            rmcp::model::NumberOrString::String("escalation-test".into()),
+        ));
+
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec!["-c".to_string(), "sleep 0.3; echo done".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "expected the call to outlive self.timeout, got: {}",
+            text_of(&result)
+        );
+        assert!(text_of(&result).contains("done"));
+    }
+
+    #[tokio::test]
+    async fn without_a_progress_token_the_default_timeout_still_applies() {
+        // The other half of the escalation rule: a caller that attaches
+        // nothing must see byte-identical pre-streaming behaviour, so the
+        // same 300ms command still times out against a 100ms timeout.
+        let server = allow_all_server(Duration::from_millis(100));
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec!["-c".to_string(), "sleep 0.3; echo done".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_of(&result).contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_leaked_reader_cannot_keep_streaming_after_the_call_has_ended() {
+        // The grandchild shape: `sh` exits at once, but the backgrounded
+        // subshell inherits both pipe write ends and outlives it. Its `echo
+        // leaked` fires at ~3s, deliberately past POST_EXIT_READ_TIMEOUT (2s),
+        // so it lands after `dispatch()` has already returned its result.
+        //
+        // Before the fix, the elapsed post-exit drain merely dropped the
+        // reader's `JoinHandle`, which detaches a Tokio task rather than
+        // cancelling it. The detached reader still held a live `ChunkSink`
+        // clone, so "leaked" would be forwarded to `peer.notify_progress` and
+        // a `notifications/progress` frame would appear on the wire for a call
+        // that was already over. The explicit `.abort()` is what stops it.
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let server = allow_all_server(Duration::from_secs(30));
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let _running =
+            serve_directly::<RoleServer, _, _, _, _>(server.clone(), server_transport, None);
+        let mut ctx = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            _running.peer().clone(),
+        );
+        ctx.meta.set_progress_token(rmcp::model::ProgressToken(
+            rmcp::model::NumberOrString::String("leak-test".into()),
+        ));
+
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "echo one; (sleep 3; echo leaked; sleep 30) & exit 0".to_string(),
+                ],
+                ctx,
+                None,
+            )
+            .await;
+        assert_eq!(result.is_error, Some(false));
+
+        // Read the wire for a bounded window that spans the grandchild's
+        // 3s emission. Nothing carrying "leaked" may arrive.
+        let mut reader = BufReader::new(client_transport);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+        loop {
+            let mut line = String::new();
+            let read = tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await;
+            let Ok(Ok(n)) = read else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if frame["method"] == "notifications/progress" {
+                let message = frame["params"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    !message.contains("leaked"),
+                    "a detached reader kept streaming after the call ended: {frame:?}"
+                );
+            }
+        }
+    }
+
+    /// Regression guard on the streaming path itself.
+    ///
+    /// Every other test here goes through `test_request_context`, whose
+    /// `RequestContext::new` leaves `meta` empty, so
+    /// `ctx.meta.get_progress_token()` returns `None` and the chunk sink is
+    /// never built. This test is the only one that sets a real progress
+    /// token, and so the only one that exercises the sink and the
+    /// `peer.notify_progress(...)` call at all.
+    ///
+    /// It asserts at the wire level rather than through a typed struct: it
+    /// keeps the *client* half of the duplex transport (the half the shared
+    /// helper throws away), reads the newline-delimited JSON-RPC frames rmcp
+    /// writes there, and inspects the raw JSON. That is what makes the
+    /// "`total` is absent" assertion meaningful, since these calls have no
+    /// known duration and the design intent is that no bogus denominator is
+    /// ever put on the wire.
+    #[tokio::test]
+    async fn output_chunks_are_streamed_to_the_caller_as_progress_notifications() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let server = allow_all_server(Duration::from_secs(10));
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let _running =
+            serve_directly::<RoleServer, _, _, _, _>(server.clone(), server_transport, None);
+
+        let mut ctx = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            _running.peer().clone(),
+        );
+        ctx.meta.set_progress_token(rmcp::model::ProgressToken(
+            rmcp::model::NumberOrString::String("stream-test".into()),
+        ));
+
+        // Two writes separated by a pause, so the pipe genuinely yields two
+        // distinct reads and therefore two distinct chunks. A single
+        // `echo one; echo two` could be coalesced into one read and would
+        // prove nothing about the counter advancing.
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "echo one; sleep 0.3; echo two".to_string(),
+                ],
+                ctx,
+                None,
+            )
+            .await;
+        assert_eq!(result.is_error, Some(false));
+
+        // The notifications are sent from a spawned task, so they may still
+        // be in flight when `dispatch` returns. Read until two progress
+        // frames have arrived, bounded so a genuine failure fails the test
+        // rather than hanging it.
+        let mut reader = BufReader::new(client_transport);
+        let mut progress_frames: Vec<serde_json::Value> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while progress_frames.len() < 2 {
+            let mut line = String::new();
+            let read = tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await;
+            let Ok(Ok(n)) = read else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if frame["method"] == "notifications/progress" {
+                progress_frames.push(frame);
+            }
+        }
+
+        assert!(
+            progress_frames.len() >= 2,
+            "expected at least two progress notifications, got {}: {progress_frames:?}",
+            progress_frames.len()
+        );
+
+        let mut last_progress = 0.0_f64;
+        let mut streamed = String::new();
+        for frame in &progress_frames {
+            let params = &frame["params"];
+
+            assert_eq!(
+                params["progressToken"], "stream-test",
+                "notification addressed to the wrong token: {frame:?}"
+            );
+
+            let progress = params["progress"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("progress was not a number: {frame:?}"));
+            assert!(
+                progress > last_progress,
+                "progress counter did not increase: {last_progress} then {progress}"
+            );
+            last_progress = progress;
+
+            // Duration is unknown for a streaming call, so no denominator is
+            // claimed. Absent from the JSON, not merely null.
+            assert!(
+                params.get("total").is_none(),
+                "total must not appear on the wire: {frame:?}"
+            );
+
+            streamed.push_str(
+                params["message"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("message was missing or not a string: {frame:?}")),
+            );
+        }
+
+        assert!(
+            streamed.contains("one") && streamed.contains("two"),
+            "streamed chunks did not carry the command's output: {streamed:?}"
+        );
     }
 }

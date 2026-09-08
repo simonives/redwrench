@@ -9,6 +9,7 @@ pub struct ExecutionResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    pub cancelled: bool,
 }
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
@@ -57,6 +58,120 @@ fn truncate_output(data: Vec<u8>) -> String {
     }
 }
 
+/// A channel for forwarding output chunks as they arrive, used to power
+/// live streaming via MCP progress notifications. `dispatch()` (the only
+/// caller that knows about `rmcp`) owns the receiving end; this module
+/// stays free of any MCP-specific types, the same separation `dispatch()`
+/// already draws between "run a process" (this file) and "speak MCP"
+/// (`tools/mod.rs`).
+pub type ChunkSink = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Appends the "why this ended" note to whatever stderr the command had
+/// already produced, rather than replacing it.
+///
+/// The timeout and cancellation arms both owe the caller two things now: the
+/// real stderr captured before the kill, and the reason the call ended. The
+/// note goes last so it reads as the terminating line.
+fn with_note(captured: String, note: &str) -> String {
+    if captured.is_empty() {
+        note.to_string()
+    } else if captured.ends_with('\n') {
+        format!("{captured}{note}")
+    } else {
+        format!("{captured}\n{note}")
+    }
+}
+
+/// The buffer a pipe reader accumulates into, shared with `execute` so its
+/// contents survive the reader being aborted.
+///
+/// A `std::sync::Mutex` rather than a `tokio` one on purpose: the guard is
+/// never held across an `.await`, so it cannot block the runtime and cannot
+/// be poisoned by an abort landing mid-critical-section.
+type SharedBuf = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+fn take_buf(buf: &SharedBuf) -> Vec<u8> {
+    let mut guard = buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut guard)
+}
+
+/// Reads one pipe to EOF (or to [`READ_LIMIT_BYTES`]), appending into `buf`
+/// and forwarding each chunk to `sink` as it arrives.
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(
+    pipe: R,
+    buf: SharedBuf,
+    sink: Option<ChunkSink>,
+) {
+    let mut reader = pipe.take(READ_LIMIT_BYTES);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(&chunk[..n]);
+                if let Some(sink) = &sink {
+                    let _ = sink.send(String::from_utf8_lossy(&chunk[..n]).into_owned());
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Awaits one pipe-reader task under [`POST_EXIT_READ_TIMEOUT`], aborting it
+/// if that window elapses, then returns whatever it accumulated either way.
+///
+/// NOTE (post-review fix, detached reader tasks): the elapsed branch used to
+/// let `.ok()` simply drop the `JoinHandle`. Dropping a `JoinHandle` in Tokio
+/// *detaches* the task, it does not cancel it, so in the grandchild case
+/// (`sh -c 'sleep 30 & exit 0'`) both readers stayed alive for as long as the
+/// grandchild held the pipe. That was an invisible leak before streaming;
+/// now those tasks still hold a live [`ChunkSink`] clone, so a leaked reader
+/// keeps feeding `notifications/progress` frames for a request whose response
+/// has already been sent. The explicit `.abort()` is what stops that.
+async fn drain_one(mut task: tokio::task::JoinHandle<()>, buf: SharedBuf) -> Vec<u8> {
+    if tokio::time::timeout(POST_EXIT_READ_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+    }
+    take_buf(&buf)
+}
+
+/// Collects whatever both readers captured, once the child is known to be
+/// gone (exited, killed on timeout, or killed on cancellation).
+///
+/// With the child dead its pipes close and the readers hit EOF almost
+/// immediately, so this is normally instant. The bound exists only for the
+/// grandchild case described on [`drain_one`]. The two drains run
+/// concurrently under `tokio::join!` so they share one
+/// [`POST_EXIT_READ_TIMEOUT`] window rather than stacking two of them.
+///
+/// All three `select!` arms use this, which is what makes a timed-out or
+/// cancelled call return the output it produced before it ended. Discarding
+/// that output was defensible when every call was bounded and short; for a
+/// genuinely indefinite call, cancellation is the *only* way it ever ends, so
+/// discarding on cancel would mean such a call could never return anything.
+async fn drain_after_kill(
+    stdout_task: tokio::task::JoinHandle<()>,
+    stdout_buf: SharedBuf,
+    stderr_task: tokio::task::JoinHandle<()>,
+    stderr_buf: SharedBuf,
+) -> (String, String) {
+    let (stdout_data, stderr_data) = tokio::join!(
+        drain_one(stdout_task, stdout_buf),
+        drain_one(stderr_task, stderr_buf)
+    );
+    (truncate_output(stdout_data), truncate_output(stderr_data))
+}
+
+/// Runs `command` with `args` as an argv vector (never through a shell),
+/// bounded by `timeout`, optionally cancellable, optionally streaming each
+/// output chunk to `chunk_sink` as it arrives.
+///
 /// Kills the spawned process on timeout via `kill_on_drop` plus an
 /// explicit `.kill()` call. This guarantees the directly-spawned
 /// process is terminated; it does not guarantee termination of any
@@ -68,10 +183,16 @@ fn truncate_output(data: Vec<u8>) -> String {
 ///
 /// Such a grandchild also inherits the stdout/stderr pipe file descriptors,
 /// which is why the post-exit drain is separately bounded by
-/// [`POST_EXIT_READ_TIMEOUT`]: without it, `execute` could return long after
+/// `POST_EXIT_READ_TIMEOUT`: without it, `execute` could return long after
 /// its own `timeout` had passed, holding a server task open for as long as
 /// the grandchild chose to live.
-pub async fn execute(command: &str, args: &[String], timeout: Duration) -> ExecutionResult {
+pub async fn execute(
+    command: &str,
+    args: &[String],
+    timeout: Duration,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    chunk_sink: Option<ChunkSink>,
+) -> ExecutionResult {
     let mut child = match Command::new(command)
         .args(args)
         .kill_on_drop(true)
@@ -86,6 +207,7 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
                 stdout: String::new(),
                 stderr: format!("failed to spawn command: {err}"),
                 timed_out: false,
+                cancelled: false,
             };
         }
     };
@@ -102,20 +224,37 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
     //
     // Each read is bounded by `READ_LIMIT_BYTES` (see the note there): the
     // `.take()` adapter caps the reader itself, so the peak allocation is a
-    // small constant regardless of how much the command emits.
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stdout.take(READ_LIMIT_BYTES).read_to_end(&mut buf).await;
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stderr.take(READ_LIMIT_BYTES).read_to_end(&mut buf).await;
-        buf
-    });
+    // small constant regardless of how much the command emits. Each chunk
+    // read is also forwarded to `chunk_sink` as it arrives (if present),
+    // so streaming adds no additional buffering of its own and cannot
+    // reopen the unbounded-memory hole `READ_LIMIT_BYTES` closed: a
+    // firehose command is still capped at a small constant allocation
+    // whether or not a caller is listening for chunks.
+    //
+    // Each reader accumulates into a shared buffer rather than returning one
+    // from the task. NOTE (post-review fix): a task's own local `Vec` is only
+    // observable if the task is joined, so aborting a reader that a
+    // grandchild is holding open would throw away everything it had already
+    // captured. Sharing the buffer means the abort path is now "stop reading
+    // and take what you have", which is what makes a cancelled indefinite
+    // call return real output.
+    let stdout_buf: SharedBuf = SharedBuf::default();
+    let stderr_buf: SharedBuf = SharedBuf::default();
+
+    let stdout_sink = chunk_sink.clone();
+    let stdout_task = tokio::spawn(read_pipe(stdout, stdout_buf.clone(), stdout_sink));
+    let stderr_sink = chunk_sink;
+    let stderr_task = tokio::spawn(read_pipe(stderr, stderr_buf.clone(), stderr_sink));
 
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
+    let cancelled_fut = async {
+        match &cancellation {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancelled_fut);
 
     tokio::select! {
         status = child.wait() => {
@@ -125,46 +264,60 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
             // timeout exists to prevent. A grandchild that inherited the
             // stdio file descriptors and outlives the direct child (the
             // classic `sh -c 'sleep 30 & exit 0'` shape) keeps the write
-            // end of both pipes open, so `read_to_end` blocks until the
+            // end of both pipes open, so the read loop blocks until the
             // grandchild exits, long after the child's exit status has
             // already been reported. The spec is explicit that a hung
             // process must not be able to wedge the server, so bound the
             // post-exit drain with a short secondary timeout and fall back
             // to whatever was captured (or nothing) if it elapses.
-            let stdout_data = tokio::time::timeout(POST_EXIT_READ_TIMEOUT, stdout_task)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or_default();
-            let stderr_data = tokio::time::timeout(POST_EXIT_READ_TIMEOUT, stderr_task)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or_default();
+            let (stdout_data, stderr_data) = drain_after_kill(stdout_task, stdout_buf, stderr_task, stderr_buf).await;
             match status {
                 Ok(status) => ExecutionResult {
                     exit_code: status.code(),
-                    stdout: truncate_output(stdout_data),
-                    stderr: truncate_output(stderr_data),
+                    stdout: stdout_data,
+                    stderr: stderr_data,
                     timed_out: false,
+                    cancelled: false,
                 },
                 Err(err) => ExecutionResult {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: format!("command failed: {err}"),
                     timed_out: false,
+                    cancelled: false,
                 },
             }
         },
         _ = &mut sleep => {
+            // NOTE (post-review fix, discarded output): the readers used to be
+            // `.abort()`ed here and both streams returned empty. Kill the
+            // child first, then drain: with the process gone the pipes close
+            // and the readers finish at once, so the caller gets everything
+            // captured up to the moment the ceiling was reached.
             let _ = child.kill().await;
-            stdout_task.abort();
-            stderr_task.abort();
+            let (stdout_data, stderr_data) = drain_after_kill(stdout_task, stdout_buf, stderr_task, stderr_buf).await;
             ExecutionResult {
                 exit_code: None,
-                stdout: String::new(),
-                stderr: format!("command timed out after {timeout:?}"),
+                stdout: stdout_data,
+                stderr: with_note(stderr_data, &format!("command timed out after {timeout:?}")),
                 timed_out: true,
+                cancelled: false,
+            }
+        },
+        _ = &mut cancelled_fut => {
+            // Same as the timeout arm, and it matters more here: for a
+            // genuinely indefinite call (`ping` with no count,
+            // `journalctl_tail` with follow) cancellation is the only way the
+            // call ever ends, so discarding the buffer meant such a call
+            // could never return anything at all.
+            let _ = child.kill().await;
+            let (stdout_data, stderr_data) = drain_after_kill(stdout_task, stdout_buf, stderr_task, stderr_buf).await;
+            ExecutionResult {
+                exit_code: None,
+                stdout: stdout_data,
+                stderr: with_note(stderr_data, "command cancelled by caller"),
+                timed_out: false,
+                cancelled: true,
             }
         }
     }
@@ -177,7 +330,14 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stdout_and_exit_code_of_a_successful_command() {
-        let result = execute("echo", &["hello".to_string()], Duration::from_secs(5)).await;
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout.trim(), "hello");
         assert!(!result.timed_out);
@@ -189,6 +349,8 @@ mod tests {
             "ls",
             &["/nonexistent-path-xyz".to_string()],
             Duration::from_secs(5),
+            None,
+            None,
         )
         .await;
         assert_ne!(result.exit_code, Some(0));
@@ -204,6 +366,8 @@ mod tests {
             "echo",
             &["hello; echo pwned".to_string()],
             Duration::from_secs(5),
+            None,
+            None,
         )
         .await;
         assert_eq!(result.stdout.trim(), "hello; echo pwned");
@@ -211,7 +375,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_exceeding_the_timeout_is_killed_and_marked_timed_out() {
-        let result = execute("sleep", &["5".to_string()], Duration::from_millis(100)).await;
+        let result = execute(
+            "sleep",
+            &["5".to_string()],
+            Duration::from_millis(100),
+            None,
+            None,
+        )
+        .await;
         assert!(result.timed_out);
         assert_eq!(result.exit_code, None);
     }
@@ -222,6 +393,8 @@ mod tests {
             "seq",
             &["1".to_string(), "1000000".to_string()],
             Duration::from_secs(10),
+            None,
+            None,
         )
         .await;
         assert!(result.stdout.len() <= MAX_OUTPUT_BYTES + 200);
@@ -254,6 +427,8 @@ mod tests {
             "seq",
             &["1".to_string(), "500000000".to_string()],
             Duration::from_secs(60),
+            None,
+            None,
         )
         .await;
 
@@ -283,11 +458,158 @@ mod tests {
             "seq",
             &["1".to_string(), "1000000".to_string()],
             Duration::from_secs(30),
+            None,
+            None,
         )
         .await;
         assert!(result.stdout.contains(&format!(
             "[output truncated, only the first {MAX_OUTPUT_BYTES} bytes are shown]"
         )));
+    }
+
+    #[tokio::test]
+    async fn each_output_chunk_is_forwarded_to_the_sink_as_it_arrives() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            Some(tx),
+        )
+        .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.cancelled);
+
+        let mut forwarded = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            forwarded.push_str(&chunk);
+        }
+        assert!(
+            forwarded.contains("hello"),
+            "expected forwarded output to contain 'hello', got: {forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_sink_means_no_behavioural_change_from_the_buffered_path() {
+        // Regression guard: a caller that doesn't opt into streaming must see
+        // exactly today's behaviour, nothing sent anywhere, one buffered result.
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "hello");
+        assert!(!result.cancelled);
+        assert!(!result.timed_out);
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_the_process_and_marks_the_result_cancelled() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let ct = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ct.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = execute(
+            "sleep",
+            &["30".to_string()],
+            Duration::from_secs(60),
+            Some(cancellation),
+            None,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "expected cancellation to end the call quickly, took {:?}",
+            started.elapsed()
+        );
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_command_returns_the_output_it_produced_before_cancellation() {
+        // Regression guard: the cancel arm used to abort both readers and
+        // return empty strings. For an indefinite call, cancellation is the
+        // only way the call ever ends, so that meant an operator who ran
+        // `ping` for 25 minutes and then stopped it got nothing back.
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let ct = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            ct.cancel();
+        });
+
+        let result = execute(
+            "sh",
+            &["-c".to_string(), "echo before-cancel; sleep 30".to_string()],
+            Duration::from_secs(60),
+            Some(cancellation),
+            None,
+        )
+        .await;
+
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+        assert!(
+            result.stdout.contains("before-cancel"),
+            "cancellation discarded the buffered output, got: {:?}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_returns_the_output_it_produced_before_the_timeout() {
+        // The same guarantee on the timeout arm, which shared the discarding
+        // behaviour. The "timed out" note is appended to the captured stderr
+        // rather than replacing it.
+        let result = execute(
+            "sh",
+            &[
+                "-c".to_string(),
+                "echo before-timeout; sleep 30".to_string(),
+            ],
+            Duration::from_millis(150),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.timed_out);
+        assert!(
+            result.stdout.contains("before-timeout"),
+            "the timeout discarded the buffered output, got: {:?}",
+            result.stdout
+        );
+        assert!(result.stderr.contains("command timed out after"));
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_indefinite_command_is_still_bounded_by_the_timeout() {
+        // The existing timeout still applies even when a cancellation token is
+        // supplied but never fires: the safety net is not optional.
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let result = execute(
+            "sleep",
+            &["30".to_string()],
+            Duration::from_millis(100),
+            Some(cancellation),
+            None,
+        )
+        .await;
+        assert!(result.timed_out);
+        assert!(!result.cancelled);
     }
 
     #[tokio::test]
@@ -308,6 +630,8 @@ mod tests {
                 "sh",
                 &["-c".to_string(), "sleep 30 & exit 0".to_string()],
                 Duration::from_secs(20),
+                None,
+                None,
             ),
         )
         .await

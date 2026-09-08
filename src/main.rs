@@ -113,6 +113,7 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         Arc::new(policy::PolicyEngine::new(config.effective_rules())),
         Duration::from_secs(config.timeout_secs),
         tier_name,
+        Duration::from_secs(config.max_stream_duration_secs),
     );
 
     use rmcp::transport::streamable_http_server::{

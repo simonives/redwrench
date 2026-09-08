@@ -62,6 +62,20 @@ When adding a new tool, work out which shape your free-text parameter
 occupies before picking a fix, applying the wrong one gives a false
 sense of safety.
 
+## The fourth rule
+
+**A tool wanting to stream output or run indefinitely does not build its
+own timeout or streaming logic.** `dispatch()` already does this for
+every tool, uniformly: pass an `Option<Duration>` override when a call
+should use the safety-net `max_stream_duration` instead of the ordinary
+default (see `ping`'s optional `count` or `journalctl_tail`'s `follow`),
+and `dispatch()` handles cancellation and progress-token-triggered
+streaming the same way for every tool, whether or not it opted into a
+duration override. Reimplementing any part of this in a tool file is the
+same class of mistake the first rule warns against for policy checks:
+`dispatch` is the one place that gets this right, a tool that bypasses it
+will get subtly wrong behaviour, not a shortcut.
+
 ## Before submitting a change
 
 Run `cargo test`. If you changed `src/policy/`, make sure you added a

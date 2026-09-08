@@ -43,8 +43,9 @@ impl RedWrenchServer {
     pub async fn dnf_install(
         &self,
         Parameters(DnfPackageParams { package }): Parameters<DnfPackageParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        self.dispatch("dnf_install", "dnf", install_argv(package))
+        self.dispatch("dnf_install", "dnf", install_argv(package), ctx, None)
             .await
     }
 
@@ -52,8 +53,9 @@ impl RedWrenchServer {
     pub async fn dnf_remove(
         &self,
         Parameters(DnfPackageParams { package }): Parameters<DnfPackageParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        self.dispatch("dnf_remove", "dnf", remove_argv(package))
+        self.dispatch("dnf_remove", "dnf", remove_argv(package), ctx, None)
             .await
     }
 }

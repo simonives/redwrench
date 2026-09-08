@@ -69,10 +69,25 @@ fn deny(command: &str, arg_pattern: &str) -> Rule {
 /// never preceded by whitespace or the start of the string. `A`, `l` and
 /// `s` are matched case-sensitively, and no other `ping` option uses those
 /// exact letters in those exact cases, so nothing legitimate is rejected.
+///
+/// Two further zero-interval forms were closed in a later pass: `ping`
+/// parses `-i`'s argument with `strtod`, which accepts scientific-notation
+/// (`0e0`, `0E0`, `0e+0`, `0e-0`, `00e00`) and hex (`0x0`, `0X0`, `0x00`)
+/// spellings of zero in addition to the plain decimal and integer forms
+/// already matched above. Both still flood exactly as `-i 0` or `-i 0.0`
+/// do, and neither contains a literal `.` or a bare trailing `0`-only
+/// token the earlier alternatives look for, so both sailed through
+/// unmatched. The interval alternative now also matches `0+[eE][+-]?0+`
+/// (scientific notation: any number of leading and trailing zero digits,
+/// `strtod` accepts `00e00` as readily as `0e0`, and an optional sign on
+/// the exponent) and `0[xX]0+` (hex: `strtod`'s `0x`/`0X` prefix requires
+/// exactly one leading zero, so this one does not need the `+`), each
+/// terminated by whitespace or the end of the string like the existing
+/// forms.
 const PING_ABUSE_FLAGS: &str = concat!(
     r"(?:^|\s)-[A-Za-z]*f",
     r"|--flood",
-    r"|(?:^|\s)-[A-Za-z]*i\s*(?:0*\.\d|0+(?:\s|$))",
+    r"|(?:^|\s)-[A-Za-z]*i\s*(?:0*\.\d|0+(?:\s|$)|0+[eE][+-]?0+(?:\s|$)|0[xX]0+(?:\s|$))",
     r"|(?:^|\s)-[A-Za-z]*A",
     r"|(?:^|\s)-[A-Za-z]*l",
     r"|(?:^|\s)-[A-Za-z]*s",
@@ -419,6 +434,23 @@ mod tests {
             vec!["-i0".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), "00".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), "0".to_string()],
+            // strtod-based parsing also accepts scientific-notation and
+            // hex spellings of zero, both of which still flood.
+            vec!["-i".to_string(), "0e0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0E0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0e+0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0e-0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "00e00".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0x0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0X0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0x00".to_string(), "8.8.8.8".to_string()],
+            vec!["-i0e0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i0x0".to_string(), "8.8.8.8".to_string()],
+            // Clustered short-option form, consistent with how the file
+            // already tests clustering for this constant: `-ci0x0` is
+            // `-c -i 0x0` (flood interval clustered with count).
+            vec!["-ci0x0".to_string(), "8.8.8.8".to_string()],
+            vec!["-ci0e0".to_string(), "8.8.8.8".to_string()],
             // Adaptive ping: paced to the round-trip time, which on a LAN
             // is flood ping under another name.
             vec!["-A".to_string(), "8.8.8.8".to_string()],
@@ -460,6 +492,9 @@ mod tests {
             // an all-zero value is a flood.
             vec!["-i".to_string(), "1".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), "10".to_string(), "8.8.8.8".to_string()],
+            // A non-zero scientific-notation interval is an ordinary
+            // interval, not a flood, and must survive the new alternative.
+            vec!["-i".to_string(), "1e0".to_string(), "8.8.8.8".to_string()],
             // Uppercase `-S` (sndbuf) is a different option from `-s`, and
             // the deny alternatives are case-sensitive.
             vec!["-S".to_string(), "1024".to_string(), "8.8.8.8".to_string()],

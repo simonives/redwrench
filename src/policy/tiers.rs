@@ -77,17 +77,28 @@ fn deny(command: &str, arg_pattern: &str) -> Rule {
 /// already matched above. Both still flood exactly as `-i 0` or `-i 0.0`
 /// do, and neither contains a literal `.` or a bare trailing `0`-only
 /// token the earlier alternatives look for, so both sailed through
-/// unmatched. The interval alternative now also matches `0+[eE][+-]?0+`
-/// (scientific notation: any number of leading and trailing zero digits,
-/// `strtod` accepts `00e00` as readily as `0e0`, and an optional sign on
-/// the exponent) and `0[xX]0+` (hex: `strtod`'s `0x`/`0X` prefix requires
-/// exactly one leading zero, so this one does not need the `+`), each
-/// terminated by whitespace or the end of the string like the existing
-/// forms.
+/// unmatched.
+///
+/// A subsequent adversarial review found the first fix for those two forms
+/// still had gaps within its own class, all `strtod`-zero, all flooding
+/// exactly like `-i 0`: a leading sign (`-i +0`), a non-zero exponent on a
+/// zero mantissa (`-i 0e5`, since `0 * 10^5` is still `0`), and a hex
+/// floating-point form with a binary exponent (`-i 0x0p0`, C99 hex-float
+/// syntax `strtod` also accepts). The interval alternative now matches an
+/// optional leading `[+-]` on every zero form, `0+[eE][+-]?\d+` for
+/// scientific notation (the exponent's own digits no longer need to be
+/// zero, only the mantissa does), and `0[xX]0+(?:[pP][+-]?\d+)?` for hex
+/// (the `p`-exponent, if present at all, is likewise unconstrained), each
+/// still terminated by whitespace or the end of the string. `0x0` without
+/// a `p`-exponent remains matched too, since `strtod` still accepts that
+/// form even though it is not a strictly conforming C99 hex float.
 const PING_ABUSE_FLAGS: &str = concat!(
     r"(?:^|\s)-[A-Za-z]*f",
     r"|--flood",
-    r"|(?:^|\s)-[A-Za-z]*i\s*(?:0*\.\d|0+(?:\s|$)|0+[eE][+-]?0+(?:\s|$)|0[xX]0+(?:\s|$))",
+    r"|(?:^|\s)-[A-Za-z]*i\s*(?:0*\.\d",
+    r"|[+-]?0+(?:\s|$)",
+    r"|[+-]?0+[eE][+-]?\d+(?:\s|$)",
+    r"|[+-]?0[xX]0+(?:[pP][+-]?\d+)?(?:\s|$))",
     r"|(?:^|\s)-[A-Za-z]*A",
     r"|(?:^|\s)-[A-Za-z]*l",
     r"|(?:^|\s)-[A-Za-z]*s",
@@ -451,6 +462,21 @@ mod tests {
             // `-c -i 0x0` (flood interval clustered with count).
             vec!["-ci0x0".to_string(), "8.8.8.8".to_string()],
             vec!["-ci0e0".to_string(), "8.8.8.8".to_string()],
+            // A second adversarial pass found these still slipped through
+            // the first zero-interval fix, all `strtod`-zero, all flooding
+            // the same as `-i 0`.
+            vec!["-i".to_string(), "+0".to_string(), "8.8.8.8".to_string()],
+            // A non-zero exponent on a zero mantissa is still zero.
+            vec!["-i".to_string(), "0e5".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0E9".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "+0e5".to_string(), "8.8.8.8".to_string()],
+            // C99 hex-float syntax: a binary exponent on a zero mantissa.
+            vec!["-i".to_string(), "0x0p0".to_string(), "8.8.8.8".to_string()],
+            vec![
+                "-i".to_string(),
+                "0X0P+3".to_string(),
+                "8.8.8.8".to_string(),
+            ],
             // Adaptive ping: paced to the round-trip time, which on a LAN
             // is flood ping under another name.
             vec!["-A".to_string(), "8.8.8.8".to_string()],
@@ -495,6 +521,10 @@ mod tests {
             // A non-zero scientific-notation interval is an ordinary
             // interval, not a flood, and must survive the new alternative.
             vec!["-i".to_string(), "1e0".to_string(), "8.8.8.8".to_string()],
+            // A non-zero mantissa with a sign or an exponent is still an
+            // ordinary interval, not a flood: only a zero mantissa denies.
+            vec!["-i".to_string(), "+5".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "5e0".to_string(), "8.8.8.8".to_string()],
             // Uppercase `-S` (sndbuf) is a different option from `-s`, and
             // the deny alternatives are case-sensitive.
             vec!["-S".to_string(), "1024".to_string(), "8.8.8.8".to_string()],

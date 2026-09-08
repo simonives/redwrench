@@ -84,7 +84,8 @@ impl RedWrenchServer {
                 ))])
             }
             Decision::Allowed => {
-                let result = crate::executor::execute(command, &args, self.timeout).await;
+                let result =
+                    crate::executor::execute(command, &args, self.timeout, None, None).await;
                 crate::audit::record_invocation(
                     tool,
                     command,

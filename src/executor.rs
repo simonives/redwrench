@@ -9,6 +9,7 @@ pub struct ExecutionResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    pub cancelled: bool,
 }
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
@@ -71,7 +72,21 @@ fn truncate_output(data: Vec<u8>) -> String {
 /// [`POST_EXIT_READ_TIMEOUT`]: without it, `execute` could return long after
 /// its own `timeout` had passed, holding a server task open for as long as
 /// the grandchild chose to live.
-pub async fn execute(command: &str, args: &[String], timeout: Duration) -> ExecutionResult {
+/// A channel for forwarding output chunks as they arrive, used to power
+/// live streaming via MCP progress notifications. `dispatch()` (the only
+/// caller that knows about `rmcp`) owns the receiving end; this module
+/// stays free of any MCP-specific types, the same separation `dispatch()`
+/// already draws between "run a process" (this file) and "speak MCP"
+/// (`tools/mod.rs`).
+pub type ChunkSink = tokio::sync::mpsc::UnboundedSender<String>;
+
+pub async fn execute(
+    command: &str,
+    args: &[String],
+    timeout: Duration,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    chunk_sink: Option<ChunkSink>,
+) -> ExecutionResult {
     let mut child = match Command::new(command)
         .args(args)
         .kill_on_drop(true)
@@ -86,6 +101,7 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
                 stdout: String::new(),
                 stderr: format!("failed to spawn command: {err}"),
                 timed_out: false,
+                cancelled: false,
             };
         }
     };
@@ -102,20 +118,60 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
     //
     // Each read is bounded by `READ_LIMIT_BYTES` (see the note there): the
     // `.take()` adapter caps the reader itself, so the peak allocation is a
-    // small constant regardless of how much the command emits.
+    // small constant regardless of how much the command emits. Each chunk
+    // read is also forwarded to `chunk_sink` as it arrives (if present),
+    // so streaming adds no additional buffering of its own and cannot
+    // reopen the unbounded-memory hole `READ_LIMIT_BYTES` closed: a
+    // firehose command is still capped at a small constant allocation
+    // whether or not a caller is listening for chunks.
+    let stdout_sink = chunk_sink.clone();
     let stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
-        let _ = stdout.take(READ_LIMIT_BYTES).read_to_end(&mut buf).await;
+        let mut reader = stdout.take(READ_LIMIT_BYTES);
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(sink) = &stdout_sink {
+                        let _ = sink.send(String::from_utf8_lossy(&chunk[..n]).into_owned());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         buf
     });
+    let stderr_sink = chunk_sink;
     let stderr_task = tokio::spawn(async move {
         let mut buf = Vec::new();
-        let _ = stderr.take(READ_LIMIT_BYTES).read_to_end(&mut buf).await;
+        let mut reader = stderr.take(READ_LIMIT_BYTES);
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(sink) = &stderr_sink {
+                        let _ = sink.send(String::from_utf8_lossy(&chunk[..n]).into_owned());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         buf
     });
 
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
+    let cancelled_fut = async {
+        match &cancellation {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancelled_fut);
 
     tokio::select! {
         status = child.wait() => {
@@ -125,7 +181,7 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
             // timeout exists to prevent. A grandchild that inherited the
             // stdio file descriptors and outlives the direct child (the
             // classic `sh -c 'sleep 30 & exit 0'` shape) keeps the write
-            // end of both pipes open, so `read_to_end` blocks until the
+            // end of both pipes open, so the read loop blocks until the
             // grandchild exits, long after the child's exit status has
             // already been reported. The spec is explicit that a hung
             // process must not be able to wedge the server, so bound the
@@ -147,12 +203,14 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
                     stdout: truncate_output(stdout_data),
                     stderr: truncate_output(stderr_data),
                     timed_out: false,
+                    cancelled: false,
                 },
                 Err(err) => ExecutionResult {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: format!("command failed: {err}"),
                     timed_out: false,
+                    cancelled: false,
                 },
             }
         },
@@ -165,6 +223,19 @@ pub async fn execute(command: &str, args: &[String], timeout: Duration) -> Execu
                 stdout: String::new(),
                 stderr: format!("command timed out after {timeout:?}"),
                 timed_out: true,
+                cancelled: false,
+            }
+        },
+        _ = &mut cancelled_fut => {
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            ExecutionResult {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "command cancelled by caller".to_string(),
+                timed_out: false,
+                cancelled: true,
             }
         }
     }
@@ -177,7 +248,14 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stdout_and_exit_code_of_a_successful_command() {
-        let result = execute("echo", &["hello".to_string()], Duration::from_secs(5)).await;
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout.trim(), "hello");
         assert!(!result.timed_out);
@@ -189,6 +267,8 @@ mod tests {
             "ls",
             &["/nonexistent-path-xyz".to_string()],
             Duration::from_secs(5),
+            None,
+            None,
         )
         .await;
         assert_ne!(result.exit_code, Some(0));
@@ -204,6 +284,8 @@ mod tests {
             "echo",
             &["hello; echo pwned".to_string()],
             Duration::from_secs(5),
+            None,
+            None,
         )
         .await;
         assert_eq!(result.stdout.trim(), "hello; echo pwned");
@@ -211,7 +293,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_exceeding_the_timeout_is_killed_and_marked_timed_out() {
-        let result = execute("sleep", &["5".to_string()], Duration::from_millis(100)).await;
+        let result = execute(
+            "sleep",
+            &["5".to_string()],
+            Duration::from_millis(100),
+            None,
+            None,
+        )
+        .await;
         assert!(result.timed_out);
         assert_eq!(result.exit_code, None);
     }
@@ -222,6 +311,8 @@ mod tests {
             "seq",
             &["1".to_string(), "1000000".to_string()],
             Duration::from_secs(10),
+            None,
+            None,
         )
         .await;
         assert!(result.stdout.len() <= MAX_OUTPUT_BYTES + 200);
@@ -254,6 +345,8 @@ mod tests {
             "seq",
             &["1".to_string(), "500000000".to_string()],
             Duration::from_secs(60),
+            None,
+            None,
         )
         .await;
 
@@ -283,11 +376,101 @@ mod tests {
             "seq",
             &["1".to_string(), "1000000".to_string()],
             Duration::from_secs(30),
+            None,
+            None,
         )
         .await;
         assert!(result.stdout.contains(&format!(
             "[output truncated, only the first {MAX_OUTPUT_BYTES} bytes are shown]"
         )));
+    }
+
+    #[tokio::test]
+    async fn each_output_chunk_is_forwarded_to_the_sink_as_it_arrives() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            Some(tx),
+        )
+        .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.cancelled);
+
+        let mut forwarded = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            forwarded.push_str(&chunk);
+        }
+        assert!(
+            forwarded.contains("hello"),
+            "expected forwarded output to contain 'hello', got: {forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_sink_means_no_behavioural_change_from_the_buffered_path() {
+        // Regression guard: a caller that doesn't opt into streaming must see
+        // exactly today's behaviour, nothing sent anywhere, one buffered result.
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "hello");
+        assert!(!result.cancelled);
+        assert!(!result.timed_out);
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_the_process_and_marks_the_result_cancelled() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let ct = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ct.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = execute(
+            "sleep",
+            &["30".to_string()],
+            Duration::from_secs(60),
+            Some(cancellation),
+            None,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "expected cancellation to end the call quickly, took {:?}",
+            started.elapsed()
+        );
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_indefinite_command_is_still_bounded_by_the_timeout() {
+        // The existing timeout still applies even when a cancellation token is
+        // supplied but never fires: the safety net is not optional.
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let result = execute(
+            "sleep",
+            &["30".to_string()],
+            Duration::from_millis(100),
+            Some(cancellation),
+            None,
+        )
+        .await;
+        assert!(result.timed_out);
+        assert!(!result.cancelled);
     }
 
     #[tokio::test]
@@ -308,6 +491,8 @@ mod tests {
                 "sh",
                 &["-c".to_string(), "sleep 30 & exit 0".to_string()],
                 Duration::from_secs(20),
+                None,
+                None,
             ),
         )
         .await

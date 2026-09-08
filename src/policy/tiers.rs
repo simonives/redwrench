@@ -178,7 +178,19 @@ const JOURNALCTL_MUTATION_FLAGS: &str = r"vacuum|--rot|--fl|--syn|--rel|--sm|--s
 /// that is otherwise entirely read-only. Denied before the broad allow,
 /// same first-match-wins pattern as the other tier-level hardening in
 /// this file.
-const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o\b";
+///
+/// The pattern deliberately has no word boundary after `-o`: `sar` accepts
+/// the output path attached to the flag with no separator (`-ofile.dat`),
+/// the same clustered-short-option shape `PING_ABUSE_FLAGS` was hardened
+/// against for forms like `-fc100`. A trailing `\b` would only match the
+/// space-separated form (`-o /tmp/evil.dat`, where the boundary falls on
+/// the space) and miss the attached form entirely, since `o` and the
+/// following filename character are both word characters and no boundary
+/// exists between them. None of sar's other options begin with `o`
+/// (`-u`, `-r`, `-b`, `-d`, `-n`, `-S`, `-q`, `-w`), so matching bare `-o`
+/// regardless of what follows catches both forms without rejecting any
+/// legitimate flag.
+const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o";
 
 fn safe_rules() -> Vec<Rule> {
     vec![
@@ -195,15 +207,35 @@ fn safe_rules() -> Vec<Rule> {
             Some(r"^(addr|route|link)(\s+(show|list|get)(\s.*)?)?$"),
         ),
         // Read-only resource monitoring, safe to run indefinitely under
-        // the `safe` tier: none of these mutate system state. `top`
-        // requires `-b` (batch mode), interactive top would hang as a
-        // non-interactive tool call rather than behave sensibly. `sar`'s
-        // `-o` (write raw sample data to an arbitrary path) is denied
-        // before the broad allow, the same deny-before-allow pattern
-        // used for ping/dnf/journalctl elsewhere in this file.
+        // the `safe` tier: none of these mutate system state.
+        //
+        // `vmstat`'s entire option set is reporting flags: the positional
+        // interval/count arguments and single-letter switches such as
+        // `-a` (active/inactive memory), `-s` (event counter summary),
+        // `-d` (disk stats), `-p` (per-partition stats), `-m` (slab
+        // info), `-n` (suppress repeated headers), `-S` (unit selection),
+        // `-t` (add a timestamp column) and `-w` (wide output). Every one
+        // of these only changes which columns are printed or how often;
+        // none of them write to a file, spawn a child process, or
+        // otherwise touch state outside vmstat's own stdout, so an
+        // unconditional `allow(None)` is safe.
         allow("vmstat", None),
+        // `sar`'s `-o` (write raw sample data to an arbitrary path) is
+        // denied before the broad allow, the same deny-before-allow
+        // pattern used for ping/dnf/journalctl elsewhere in this file.
         deny("sar", SAR_FILE_OUTPUT_FLAG),
         allow("sar", None),
+        // `top` requires `-b` (batch mode), interactive top would hang as
+        // a non-interactive tool call rather than behave sensibly.
+        //
+        // `^-b` also matches an invented flag like `-badness`, not just
+        // real `-b`. This is confirmed non-exploitable: execution here is
+        // argv-only with no shell involved, so there is no injection
+        // surface, and `top` itself would simply reject an unrecognised
+        // `-badness` flag with an error rather than silently falling back
+        // to interactive mode. The pattern is left loose deliberately
+        // rather than anchored to `^-b(\s|$)`, since the failure mode of
+        // over-matching here is "top errors out," not a policy bypass.
         allow("top", Some(r"^-b")),
     ]
 }
@@ -722,6 +754,30 @@ mod tests {
         assert!(matches!(
             engine.evaluate("sar", &["-o".into(), "/tmp/evil.dat".into(), "1".into()]),
             Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_sars_attached_form_output_flag_but_allows_a_legitimate_flag() {
+        // sar accepts the output path attached with no separator
+        // (`-ofile.dat`), the same clustered-short-option shape
+        // PING_ABUSE_FLAGS was hardened against. A trailing `\b` on the
+        // deny pattern would miss this form since `o` and the following
+        // filename character are both word characters.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate("sar", &["-ofile.dat".into(), "1".into(), "5".into()]),
+            Decision::Denied(_)
+        ));
+        // The existing space-separated form still works.
+        assert!(matches!(
+            engine.evaluate("sar", &["-o".into(), "/tmp/evil.dat".into()]),
+            Decision::Denied(_)
+        ));
+        // A legitimate sar flag that does not begin with `o` is unaffected.
+        assert!(matches!(
+            engine.evaluate("sar", &["-u".into(), "1".into(), "5".into()]),
+            Decision::Allowed
         ));
     }
 

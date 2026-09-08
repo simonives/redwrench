@@ -355,7 +355,10 @@ mod tests {
             "#,
         );
         let config = Config::load(file.path()).unwrap();
-        assert_eq!(config.max_stream_duration_secs, DEFAULT_MAX_STREAM_DURATION_SECS);
+        assert_eq!(
+            config.max_stream_duration_secs,
+            DEFAULT_MAX_STREAM_DURATION_SECS
+        );
         assert_eq!(config.max_stream_duration_secs, 1800);
     }
 

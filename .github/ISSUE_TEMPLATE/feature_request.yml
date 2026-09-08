@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest a new tool, a new tier rule, or a change to how RedWrench works.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before requesting a new structured tool wrapper, consider whether `run_command`
+        plus a tier allow-rule already covers it, see `ARCHITECTURE.md`'s "Adding a new
+        tool" section for when a dedicated tool file is actually warranted.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The underlying task or workflow, not just the feature you think solves it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security considerations
+      description: If this touches command execution, argument handling, or the policy engine, what could go wrong if a prompt-injected agent controlled the inputs?

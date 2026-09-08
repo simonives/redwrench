@@ -1,0 +1,8 @@
+# Default owner for everything not matched below.
+*                           @simonives
+
+# The policy engine is the security core of the project; changes here
+# get the most scrutiny regardless of who else touches the surrounding code.
+/src/policy/                @simonives
+/src/executor.rs            @simonives
+/src/auth.rs                @simonives

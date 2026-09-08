@@ -4,6 +4,13 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  workflow_dispatch:
+
+# Cancel a stale run on the same branch/PR when new commits arrive, rather
+# than burning CI minutes on output nobody will read.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -11,10 +18,23 @@ jobs:
     container:
       image: fedora:latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install build dependencies
         run: dnf install -y cargo rust rustfmt clippy systemd-devel gcc pkgconf-pkg-config
 
-      - uses: actions/checkout@v4
+      # Fedora's container image has no git installed by default, which
+      # Swatinem/rust-cache shells out to for cache-key hashing; add it
+      # explicitly rather than let the cache step silently degrade.
+      - name: Install git (for cache key hashing)
+        run: dnf install -y git
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # This container is Fedora-specific and distinct from any other
+          # workflow's cache, keep the key scoped so it never collides.
+          prefix-key: "fedora-container"
 
       - name: Run tests
         run: cargo test --workspace --locked

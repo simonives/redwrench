@@ -37,3 +37,10 @@ clap_mangen = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the streaming test in `src/tools/mod.rs` reads the raw
+# newline-delimited JSON-RPC frames off the client half of the duplex
+# transport, so it needs to inspect the wire form of a
+# `notifications/progress` message directly rather than through a typed
+# struct (asserting `total` is genuinely absent from the JSON, not merely
+# `None` after deserialisation). Already in the lock file via rmcp.
+serde_json = "1"

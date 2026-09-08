@@ -80,10 +80,11 @@ const PING_ABUSE_FLAGS: &str = concat!(
 
 /// systemctl flags that redirect the operation away from the local system.
 /// `--host`/`-H` runs the command against a remote machine over SSH,
-/// `--machine`/`-M` against a local container, and `--root` against an
-/// arbitrary filesystem tree. `--host` in particular turns the `safe`
-/// tier's read-only `systemctl status` into an arbitrary outbound SSH
-/// connection using this machine's identity.
+/// `--machine`/`-M` against a local container, `--root` against an
+/// arbitrary filesystem tree, and `--image`/`--image-policy` against a disk
+/// image rather than the running system. `--host` in particular turns the
+/// `safe` tier's read-only `systemctl status` into an arbitrary outbound
+/// SSH connection using this machine's identity.
 ///
 /// `src/tools/systemctl.rs` already inserts a `--` separator so its own
 /// argv builders cannot be tricked this way, but that only protects the
@@ -108,11 +109,17 @@ const PING_ABUSE_FLAGS: &str = concat!(
 ///   letter, so `--mac` resolves uniquely to `--machine`.
 /// * `--ro` — `--root` is the only `--ro` option; `--read-only`,
 ///   `--recursive` and `--reverse` are `--re`, and `--runtime` is `--ru`.
+/// * `--im` — `--image` and `--image-policy` are the only `systemctl` long
+///   options beginning `--im` (the other nearby `--i` option is
+///   `--ignore-dependencies`/`--ignore-inhibitors`, which diverge at `--ig`),
+///   so `--im` resolves unambiguously to one of the two, and both belong to
+///   the same "operate against a disk image, not the local system" family
+///   this deny closes.
 ///
 /// Requiring the leading `--` (and a word boundary before it) keeps these
 /// short prefixes from matching a unit name that happens to contain the
 /// same letters.
-const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro)|(?:^|\s)-[A-Za-z]*[HM]";
+const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro|im)|(?:^|\s)-[A-Za-z]*[HM]";
 
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
@@ -589,6 +596,24 @@ mod tests {
                     "--ho=evil.example".to_string(),
                     "sshd".to_string(),
                 ],
+                // --image/--image-policy redirect against a disk image
+                // rather than the running system, the same family --host/
+                // --machine/--root are already denied for.
+                vec![
+                    "status".to_string(),
+                    "--image=/path/to.raw".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--im=/path/to.raw".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--image-policy=root=verity".to_string(),
+                    "sshd".to_string(),
+                ],
             ] {
                 assert!(
                     matches!(engine.evaluate("systemctl", &denied), Decision::Denied(_)),
@@ -617,6 +642,14 @@ mod tests {
                 vec![
                     "status".to_string(),
                     "--type=service".to_string(),
+                    "sshd".to_string(),
+                ],
+                // A real systemctl long option sharing the `--i` prefix
+                // with --image, but diverging at the third letter, must
+                // survive the new --im prefix.
+                vec![
+                    "status".to_string(),
+                    "--ignore-dependencies".to_string(),
                     "sshd".to_string(),
                 ],
             ] {

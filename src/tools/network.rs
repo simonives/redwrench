@@ -53,8 +53,12 @@ impl RedWrenchServer {
     }
 
     #[tool(description = "Show network interface addresses. Allowed under every tier.")]
-    pub async fn ip_addr(&self) -> CallToolResult {
-        self.dispatch("ip_addr", "ip", vec!["addr".into()]).await
+    pub async fn ip_addr(
+        &self,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
+        self.dispatch("ip_addr", "ip", vec!["addr".into()], ctx, None)
+            .await
     }
 }
 

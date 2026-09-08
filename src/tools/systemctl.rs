@@ -66,8 +66,9 @@ impl RedWrenchServer {
     pub async fn systemctl_status(
         &self,
         Parameters(SystemctlStatusParams { unit }): Parameters<SystemctlStatusParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        self.dispatch("systemctl_status", "systemctl", status_argv(unit))
+        self.dispatch("systemctl_status", "systemctl", status_argv(unit), ctx, None)
             .await
     }
 
@@ -78,6 +79,7 @@ impl RedWrenchServer {
     pub async fn systemctl_control(
         &self,
         Parameters(SystemctlControlParams { action, unit }): Parameters<SystemctlControlParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
         if !is_allowed_action(&action) {
             return CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
@@ -85,8 +87,14 @@ impl RedWrenchServer {
                 ALLOWED_ACTIONS.join(", ")
             ))]);
         }
-        self.dispatch("systemctl_control", "systemctl", control_argv(action, unit))
-            .await
+        self.dispatch(
+            "systemctl_control",
+            "systemctl",
+            control_argv(action, unit),
+            ctx,
+            None,
+        )
+        .await
     }
 }
 
@@ -185,13 +193,18 @@ mod tests {
             }])),
             Duration::from_secs(5),
             "unrestricted".to_string(),
+            Duration::from_secs(1800),
         );
+        let (ctx, _guard) = crate::tools::tests::test_request_context(&server);
 
         let result = server
-            .systemctl_control(Parameters(SystemctlControlParams {
-                action: "reboot".to_string(),
-                unit: "sshd".to_string(),
-            }))
+            .systemctl_control(
+                Parameters(SystemctlControlParams {
+                    action: "reboot".to_string(),
+                    unit: "sshd".to_string(),
+                }),
+                ctx,
+            )
             .await;
 
         assert_eq!(result.is_error, Some(true));

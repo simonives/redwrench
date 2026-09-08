@@ -98,14 +98,30 @@ impl RedWrenchServer {
                 ))])
             }
             Decision::Allowed => {
-                let effective_timeout = max_duration_override.unwrap_or(self.timeout);
-
                 // NOTE (rmcp API adaptation): the chunk sink only exists when
                 // the caller supplied a progress token in the request's
                 // `_meta`. Without one there is nothing to address a
                 // `notifications/progress` message to, so streaming is simply
                 // off and `execute()` buffers as before.
                 let progress_token = ctx.meta.get_progress_token();
+
+                // An explicit override always wins. Failing that, a caller
+                // that attached a progress token has declared it can consume
+                // a long-running stream, so the ceiling escalates to the
+                // safety net rather than the ordinary timeout. Without this,
+                // `run_command vmstat 1` (or `top -b`, or `ping` driven
+                // through `run_command`) could never actually stream: it
+                // passes no override, so it was permanently capped at
+                // `self.timeout` no matter what the caller asked for. A
+                // caller that sent no progress token still gets `self.timeout`
+                // exactly as before.
+                let effective_timeout = max_duration_override.unwrap_or_else(|| {
+                    if progress_token.is_some() {
+                        self.max_stream_duration
+                    } else {
+                        self.timeout
+                    }
+                });
 
                 // A "started" audit entry is owed for two independent
                 // reasons, so the gate tests for both. A call carrying a
@@ -343,6 +359,66 @@ pub(crate) mod tests {
             .await;
         assert_eq!(result.is_error, Some(false));
         assert!(!text_of(&result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_attached_progress_token_escalates_the_ceiling_to_the_safety_net() {
+        // No `max_duration_override`, so before this fix the call was capped
+        // at `self.timeout` (100ms here) and `run_command` could never reach
+        // indefinite execution however the caller asked. Attaching a progress
+        // token is the caller declaring it can consume a long stream, so the
+        // ceiling becomes `max_stream_duration` (1800s from
+        // `allow_all_server`) instead, and a 300ms command completes.
+        let server = allow_all_server(Duration::from_millis(100));
+        let (server_transport, _client_transport) = tokio::io::duplex(64 * 1024);
+        let _running =
+            serve_directly::<RoleServer, _, _, _, _>(server.clone(), server_transport, None);
+        let mut ctx = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            _running.peer().clone(),
+        );
+        ctx.meta.set_progress_token(rmcp::model::ProgressToken(
+            rmcp::model::NumberOrString::String("escalation-test".into()),
+        ));
+
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec!["-c".to_string(), "sleep 0.3; echo done".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "expected the call to outlive self.timeout, got: {}",
+            text_of(&result)
+        );
+        assert!(text_of(&result).contains("done"));
+    }
+
+    #[tokio::test]
+    async fn without_a_progress_token_the_default_timeout_still_applies() {
+        // The other half of the escalation rule: a caller that attaches
+        // nothing must see byte-identical pre-streaming behaviour, so the
+        // same 300ms command still times out against a 100ms timeout.
+        let server = allow_all_server(Duration::from_millis(100));
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec!["-c".to_string(), "sleep 0.3; echo done".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_of(&result).contains("timed out"));
     }
 
     /// Regression guard on the streaming path itself.

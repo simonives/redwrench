@@ -9,6 +9,13 @@ use serde::Deserialize;
 /// to raise this via `timeout_secs`.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+/// Default safety-net ceiling, in seconds, for a call using streaming or
+/// indefinite execution (e.g. `journalctl_tail` with `follow: true`, or
+/// `ping` with no `count`). Applies regardless of whether the caller ever
+/// cancels; a client that disconnects without cancelling must not be able
+/// to keep a process running forever.
+pub const DEFAULT_MAX_STREAM_DURATION_SECS: u64 = 1800;
+
 // NOTE (post-review fix): `deny_unknown_fields` on both raw structs.
 // Without it, a typo such as `custom_rule` (singular) parses "fine" and
 // silently drops every rule the operator wrote, i.e. a security control
@@ -35,6 +42,10 @@ struct RawConfig {
     /// [`DEFAULT_TIMEOUT_SECS`].
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Safety-net maximum duration, in seconds, for streaming/indefinite
+    /// calls. Optional; defaults to [`DEFAULT_MAX_STREAM_DURATION_SECS`].
+    #[serde(default)]
+    max_stream_duration_secs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -45,6 +56,8 @@ pub struct Config {
     pub custom_rules: Vec<Rule>,
     /// Resolved command execution timeout in seconds, already defaulted.
     pub timeout_secs: u64,
+    /// Resolved safety-net duration in seconds, already defaulted.
+    pub max_stream_duration_secs: u64,
 }
 
 impl Config {
@@ -90,6 +103,9 @@ impl Config {
             tier: raw.tier,
             custom_rules,
             timeout_secs: raw.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            max_stream_duration_secs: raw
+                .max_stream_duration_secs
+                .unwrap_or(DEFAULT_MAX_STREAM_DURATION_SECS),
         })
     }
 
@@ -327,5 +343,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("empty arg_pattern"));
+    }
+
+    #[test]
+    fn max_stream_duration_secs_defaults_to_1800_when_absent() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "safe"
+            "#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.max_stream_duration_secs, DEFAULT_MAX_STREAM_DURATION_SECS);
+        assert_eq!(config.max_stream_duration_secs, 1800);
+    }
+
+    #[test]
+    fn max_stream_duration_secs_is_read_from_the_config_when_present() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "safe"
+            max_stream_duration_secs = 300
+            "#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.max_stream_duration_secs, 300);
     }
 }

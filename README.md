@@ -3,24 +3,25 @@
 [![CI](https://github.com/simonives/redwrench/actions/workflows/ci.yml/badge.svg)](https://github.com/simonives/redwrench/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-I keep a few old machines at home running Fedora, hardware too outdated
-to sell but still fine as a home server or something to tinker with. I
-wanted an AI coding agent to look after them for me: restart a service,
-chase down a bad config, run the odd diagnostic. I did not want to hand
-that same agent a shell on the machine I actually work from every day.
+I keep a few old machines at home running Fedora, and the hardware's
+too outdated to sell but still fine as a home server or something to
+tinker with. I wanted an AI coding agent to look after them for me:
+simple things like restarting a service, chasing down a bad config, or
+running the odd diagnostic. And some more complex things too, like
+installing a package I've decided I want, or working out why a service
+refuses to start after a kernel update. However I didn't want to hand
+the agents a shell on these machines.
 
 RedWrench is what I built instead. It runs on the Fedora box itself and
-speaks MCP (Model Context Protocol), the standard Claude Code, Codex,
-and most other coding agents already support. Every command the agent
-sends passes through a policy engine first, which decides what it may
-run before it runs anything at all. If the agent gets something wrong,
-the cost is a machine I can wipe and reinstall, not the one I do my real
-work on.
+uses [MCP (Model Context Protocol)](https://modelcontextprotocol.io/),
+the standard Claude Code, Codex, and most other coding agents already
+support. Every command the agents send passes through a policy engine
+first, which decides what they may run before it runs anything at all.
 
 This is a hobby project. I built it to scratch my own itch on my own
-hardware, and I'm publishing it because anyone else running old Fedora
-boxes at home will hit the same problem the moment they point an agent
-at one.
+hardware, and I'm publishing it because anyone else running similar
+machines at home will hit the same problem the moment they point an
+agent at them.
 
 Any MCP-speaking agent works: Claude Code, Codex, Google Antigravity, and
 whatever comes next. The Fedora box itself can be physically or
@@ -33,7 +34,13 @@ written to the systemd journal, whether it was permitted or refused. Three
 built-in tiers (`safe`, `standard`, `unrestricted`) set the baseline, and
 custom rules layer on top without editing a line of code.
 
-Design spec: `docs/superpowers/specs/2026-09-07-redwrench-design.md`
+RedWrench is written in Rust. A tool that spawns arbitrary processes,
+reads their output as it arrives, and enforces a policy decision before
+any of that happens needs strict guarantees on memory bounds and
+concurrent state, and Rust's compiler checks both at build time rather
+than leaving them to runtime discipline. That guarantee is the whole
+reason a tool built to run arbitrary commands safely can make that claim
+at all.
 
 ## Contents
 
@@ -161,6 +168,8 @@ tool has no business being reachable from the open internet by accident.
 - `CONTRIBUTING.md`, development workflow, the two-machine setup, and what
   a change is expected to come with.
 - `AGENTS.md`, orientation for an AI agent picking up this codebase cold.
+- `docs/superpowers/specs/2026-09-07-redwrench-design.md`, the original
+  design spec.
 
 ## License
 

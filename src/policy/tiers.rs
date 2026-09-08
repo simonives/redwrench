@@ -137,8 +137,14 @@ const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro)|(?:^|\s)-[
 /// * `--set` — no other dnf option begins `--set`.
 ///
 /// Requiring the leading `--` keeps these short prefixes from matching a
-/// package name that merely happens to contain the same letters.
-const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
+/// package name that merely happens to contain the same letters. The whole
+/// alternation is anchored to a `(?:^|\s)` token boundary before the `--`,
+/// the same style `SYSTEMCTL_HOST_REDIRECT_FLAGS` uses, so a package name or
+/// argument value that merely *contains* one of these substrings mid-word
+/// (rather than being the flag itself) is not denied, e.g. an argument
+/// containing the literal text `offset` no longer trips the `--set`
+/// fragment.
+const DNF_TRUST_BYPASS_FLAGS: &str = r"(?:^|\s)--(?:nog|repof|set)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -164,14 +170,27 @@ const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
 ///   the gap if it does.
 /// * `--set` — `--setup-keys` is the only `--set` option (`--since` is
 ///   `--si`).
+/// * `--upd` — the shortest unambiguous prefix reaching
+///   `--update-catalog`, which writes to `/var/lib/systemd/catalog`
+///   rather than `/var/log/journal` but is the same "this mutates state,
+///   it is not a read" class the rest of this constant exists to close.
+///   No other journalctl option begins `--up`.
 ///
-/// `vacuum` stays a bare substring: `--vac` is ambiguous across
-/// `--vacuum-size`, `--vacuum-time` and `--vacuum-files`, so the shortest
-/// abbreviation journalctl accepts already spells `vacuum` in full.
+/// `--vacuum` is matched as its own alternative rather than a `--rot`-style
+/// prefix: `--vac` is ambiguous across `--vacuum-size`, `--vacuum-time` and
+/// `--vacuum-files`, so the shortest abbreviation journalctl accepts already
+/// spells `--vacuum` in full. It is always `--`-prefixed in real usage
+/// (there is no bare `vacuum` subcommand), so it is anchored the same way
+/// as the other alternatives below, not left as a bare substring.
 ///
-/// Requiring the leading `--` on the rest keeps these short prefixes from
-/// matching a unit name or grep pattern containing the same letters.
-const JOURNALCTL_MUTATION_FLAGS: &str = r"vacuum|--rot|--fl|--syn|--rel|--sm|--set";
+/// The whole alternation is anchored to a `(?:^|\s)` token boundary, the
+/// same style `SYSTEMCTL_HOST_REDIRECT_FLAGS` uses, so `--vacuum` and the
+/// rest only match at the start of an argument token, not as a bare
+/// substring inside a unit name or grep pattern (e.g. a unit named
+/// `myservice--rotate.service` no longer trips `--rot` merely because the
+/// substring appears mid-token).
+const JOURNALCTL_MUTATION_FLAGS: &str =
+    r"(?:^|\s)(?:--vacuum|--rot|--fl|--syn|--rel|--sm|--set|--upd)";
 
 /// `sar`'s `-o <file>` writes its binary sample data to an arbitrary
 /// path, an arbitrary-file-write primitive wrapped in a monitoring tool
@@ -714,6 +733,88 @@ mod tests {
                 "journalctl {allowed:?} should be allowed under the safe tier"
             );
         }
+    }
+
+    #[test]
+    fn standard_tier_denies_dnf_bypass_flags_at_token_start_but_allows_a_value_that_merely_contains_the_substring(
+    ) {
+        // The alternation is anchored to a `(?:^|\s)` token boundary, so a
+        // value that merely *contains* `--nog`/`--repof`/`--set` mid-token
+        // (rather than being the flag itself, at the start of a token) is no
+        // longer denied. Each of these actually matched the old bare
+        // substring pattern (verified by hand before writing this test), so
+        // this is a real false-positive fix, not a contrived case that
+        // never would have matched.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for allowed in [
+            vec!["install".to_string(), "foo--nogfoo".to_string()],
+            vec![
+                "install".to_string(),
+                "lib--repofrompath-compat".to_string(),
+            ],
+            vec!["install".to_string(), "mypkg--set=1".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &allowed), Decision::Allowed),
+                "dnf {allowed:?} should be allowed under the standard tier \
+                 (substring, not a token-start flag)"
+            );
+        }
+
+        // The anchored form still denies the real flags at a token start.
+        assert!(matches!(
+            engine.evaluate(
+                "dnf",
+                &["install".into(), "--nogpgcheck".into(), "foo".into()]
+            ),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_journalctl_flags_at_token_start_but_allows_a_value_that_merely_contains_the_substring(
+    ) {
+        // Same anchoring fix as the dnf constant above, applied to
+        // JOURNALCTL_MUTATION_FLAGS. Each of these actually matched the old
+        // bare substring pattern (verified by hand before writing this
+        // test).
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        for allowed in [
+            vec!["myunit--rotate".to_string()],
+            vec!["unit--flush".to_string()],
+            vec!["svc--syncme".to_string()],
+            vec!["abc--relinquish".to_string()],
+            vec!["x--smtest".to_string()],
+            vec!["y--setup-keys".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("journalctl", &allowed), Decision::Allowed),
+                "journalctl {allowed:?} should be allowed under the safe tier \
+                 (substring, not a token-start flag)"
+            );
+        }
+
+        // The anchored form still denies the real flags at a token start.
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--rotate".into()]),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_journalctl_update_catalog() {
+        // `--update-catalog` writes to `/var/lib/systemd/catalog`, the same
+        // "this mutates state" class the rest of JOURNALCTL_MUTATION_FLAGS
+        // closes, but it wasn't previously covered.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--update-catalog".into()]),
+            Decision::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--upd".into()]),
+            Decision::Denied(_)
+        ));
     }
 
     #[test]

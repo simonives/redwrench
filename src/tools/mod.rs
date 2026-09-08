@@ -421,6 +421,73 @@ pub(crate) mod tests {
         assert!(text_of(&result).contains("timed out"));
     }
 
+    #[tokio::test]
+    async fn a_leaked_reader_cannot_keep_streaming_after_the_call_has_ended() {
+        // The grandchild shape: `sh` exits at once, but the backgrounded
+        // subshell inherits both pipe write ends and outlives it. Its `echo
+        // leaked` fires at ~3s, deliberately past POST_EXIT_READ_TIMEOUT (2s),
+        // so it lands after `dispatch()` has already returned its result.
+        //
+        // Before the fix, the elapsed post-exit drain merely dropped the
+        // reader's `JoinHandle`, which detaches a Tokio task rather than
+        // cancelling it. The detached reader still held a live `ChunkSink`
+        // clone, so "leaked" would be forwarded to `peer.notify_progress` and
+        // a `notifications/progress` frame would appear on the wire for a call
+        // that was already over. The explicit `.abort()` is what stops it.
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let server = allow_all_server(Duration::from_secs(30));
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let _running =
+            serve_directly::<RoleServer, _, _, _, _>(server.clone(), server_transport, None);
+        let mut ctx = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            _running.peer().clone(),
+        );
+        ctx.meta.set_progress_token(rmcp::model::ProgressToken(
+            rmcp::model::NumberOrString::String("leak-test".into()),
+        ));
+
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "echo one; (sleep 3; echo leaked; sleep 30) & exit 0".to_string(),
+                ],
+                ctx,
+                None,
+            )
+            .await;
+        assert_eq!(result.is_error, Some(false));
+
+        // Read the wire for a bounded window that spans the grandchild's
+        // 3s emission. Nothing carrying "leaked" may arrive.
+        let mut reader = BufReader::new(client_transport);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+        loop {
+            let mut line = String::new();
+            let read = tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await;
+            let Ok(Ok(n)) = read else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if frame["method"] == "notifications/progress" {
+                let message = frame["params"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    !message.contains("leaked"),
+                    "a detached reader kept streaming after the call ended: {frame:?}"
+                );
+            }
+        }
+    }
+
     /// Regression guard on the streaming path itself.
     ///
     /// Every other test here goes through `test_request_context`, whose

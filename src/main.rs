@@ -71,7 +71,7 @@ fn update_tier_in_config(
 
 async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     // NOTE (post-review fix, audit must not fail silently): if journald is
-    // unavailable (containers, non-systemd hosts), `init_journal_logging`
+    // unavailable (containers, non-systemd hosts), `audit::init_logging`
     // previously left NO tracing subscriber installed, which turns every
     // subsequent audit record and auth-failure warning into a permanent
     // no-op after one easily-missed startup line. The spec's audit

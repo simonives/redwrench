@@ -1,7 +1,7 @@
 use super::{Effect, Rule};
 use regex::Regex;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TierName {
     Safe,
@@ -69,10 +69,36 @@ fn deny(command: &str, arg_pattern: &str) -> Rule {
 /// never preceded by whitespace or the start of the string. `A`, `l` and
 /// `s` are matched case-sensitively, and no other `ping` option uses those
 /// exact letters in those exact cases, so nothing legitimate is rejected.
+///
+/// Two further zero-interval forms were closed in a later pass: `ping`
+/// parses `-i`'s argument with `strtod`, which accepts scientific-notation
+/// (`0e0`, `0E0`, `0e+0`, `0e-0`, `00e00`) and hex (`0x0`, `0X0`, `0x00`)
+/// spellings of zero in addition to the plain decimal and integer forms
+/// already matched above. Both still flood exactly as `-i 0` or `-i 0.0`
+/// do, and neither contains a literal `.` or a bare trailing `0`-only
+/// token the earlier alternatives look for, so both sailed through
+/// unmatched.
+///
+/// A subsequent adversarial review found the first fix for those two forms
+/// still had gaps within its own class, all `strtod`-zero, all flooding
+/// exactly like `-i 0`: a leading sign (`-i +0`), a non-zero exponent on a
+/// zero mantissa (`-i 0e5`, since `0 * 10^5` is still `0`), and a hex
+/// floating-point form with a binary exponent (`-i 0x0p0`, C99 hex-float
+/// syntax `strtod` also accepts). The interval alternative now matches an
+/// optional leading `[+-]` on every zero form, `0+[eE][+-]?\d+` for
+/// scientific notation (the exponent's own digits no longer need to be
+/// zero, only the mantissa does), and `0[xX]0+(?:[pP][+-]?\d+)?` for hex
+/// (the `p`-exponent, if present at all, is likewise unconstrained), each
+/// still terminated by whitespace or the end of the string. `0x0` without
+/// a `p`-exponent remains matched too, since `strtod` still accepts that
+/// form even though it is not a strictly conforming C99 hex float.
 const PING_ABUSE_FLAGS: &str = concat!(
     r"(?:^|\s)-[A-Za-z]*f",
     r"|--flood",
-    r"|(?:^|\s)-[A-Za-z]*i\s*(?:0*\.\d|0+(?:\s|$))",
+    r"|(?:^|\s)-[A-Za-z]*i\s*(?:0*\.\d",
+    r"|[+-]?0+(?:\s|$)",
+    r"|[+-]?0+[eE][+-]?\d+(?:\s|$)",
+    r"|[+-]?0[xX]0+(?:[pP][+-]?\d+)?(?:\s|$))",
     r"|(?:^|\s)-[A-Za-z]*A",
     r"|(?:^|\s)-[A-Za-z]*l",
     r"|(?:^|\s)-[A-Za-z]*s",
@@ -80,10 +106,11 @@ const PING_ABUSE_FLAGS: &str = concat!(
 
 /// systemctl flags that redirect the operation away from the local system.
 /// `--host`/`-H` runs the command against a remote machine over SSH,
-/// `--machine`/`-M` against a local container, and `--root` against an
-/// arbitrary filesystem tree. `--host` in particular turns the `safe`
-/// tier's read-only `systemctl status` into an arbitrary outbound SSH
-/// connection using this machine's identity.
+/// `--machine`/`-M` against a local container, `--root` against an
+/// arbitrary filesystem tree, and `--image`/`--image-policy` against a disk
+/// image rather than the running system. `--host` in particular turns the
+/// `safe` tier's read-only `systemctl status` into an arbitrary outbound
+/// SSH connection using this machine's identity.
 ///
 /// `src/tools/systemctl.rs` already inserts a `--` separator so its own
 /// argv builders cannot be tricked this way, but that only protects the
@@ -108,11 +135,17 @@ const PING_ABUSE_FLAGS: &str = concat!(
 ///   letter, so `--mac` resolves uniquely to `--machine`.
 /// * `--ro` — `--root` is the only `--ro` option; `--read-only`,
 ///   `--recursive` and `--reverse` are `--re`, and `--runtime` is `--ru`.
+/// * `--im` — `--image` and `--image-policy` are the only `systemctl` long
+///   options beginning `--im` (the other nearby `--i` option is
+///   `--ignore-dependencies`/`--ignore-inhibitors`, which diverge at `--ig`),
+///   so `--im` resolves unambiguously to one of the two, and both belong to
+///   the same "operate against a disk image, not the local system" family
+///   this deny closes.
 ///
 /// Requiring the leading `--` (and a word boundary before it) keeps these
 /// short prefixes from matching a unit name that happens to contain the
 /// same letters.
-const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro)|(?:^|\s)-[A-Za-z]*[HM]";
+const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro|im)|(?:^|\s)-[A-Za-z]*[HM]";
 
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
@@ -137,8 +170,14 @@ const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro)|(?:^|\s)-[
 /// * `--set` — no other dnf option begins `--set`.
 ///
 /// Requiring the leading `--` keeps these short prefixes from matching a
-/// package name that merely happens to contain the same letters.
-const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
+/// package name that merely happens to contain the same letters. The whole
+/// alternation is anchored to a `(?:^|\s)` token boundary before the `--`,
+/// the same style `SYSTEMCTL_HOST_REDIRECT_FLAGS` uses, so a package name or
+/// argument value that merely *contains* one of these substrings mid-word
+/// (rather than being the flag itself) is not denied, e.g. an argument
+/// containing the literal text `offset` no longer trips the `--set`
+/// fragment.
+const DNF_TRUST_BYPASS_FLAGS: &str = r"(?:^|\s)--(?:nog|repof|set)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -164,14 +203,27 @@ const DNF_TRUST_BYPASS_FLAGS: &str = r"--nog|--repof|--set";
 ///   the gap if it does.
 /// * `--set` — `--setup-keys` is the only `--set` option (`--since` is
 ///   `--si`).
+/// * `--upd` — the shortest unambiguous prefix reaching
+///   `--update-catalog`, which writes to `/var/lib/systemd/catalog`
+///   rather than `/var/log/journal` but is the same "this mutates state,
+///   it is not a read" class the rest of this constant exists to close.
+///   No other journalctl option begins `--up`.
 ///
-/// `vacuum` stays a bare substring: `--vac` is ambiguous across
-/// `--vacuum-size`, `--vacuum-time` and `--vacuum-files`, so the shortest
-/// abbreviation journalctl accepts already spells `vacuum` in full.
+/// `--vacuum` is matched as its own alternative rather than a `--rot`-style
+/// prefix: `--vac` is ambiguous across `--vacuum-size`, `--vacuum-time` and
+/// `--vacuum-files`, so the shortest abbreviation journalctl accepts already
+/// spells `--vacuum` in full. It is always `--`-prefixed in real usage
+/// (there is no bare `vacuum` subcommand), so it is anchored the same way
+/// as the other alternatives below, not left as a bare substring.
 ///
-/// Requiring the leading `--` on the rest keeps these short prefixes from
-/// matching a unit name or grep pattern containing the same letters.
-const JOURNALCTL_MUTATION_FLAGS: &str = r"vacuum|--rot|--fl|--syn|--rel|--sm|--set";
+/// The whole alternation is anchored to a `(?:^|\s)` token boundary, the
+/// same style `SYSTEMCTL_HOST_REDIRECT_FLAGS` uses, so `--vacuum` and the
+/// rest only match at the start of an argument token, not as a bare
+/// substring inside a unit name or grep pattern (e.g. a unit named
+/// `myservice--rotate.service` no longer trips `--rot` merely because the
+/// substring appears mid-token).
+const JOURNALCTL_MUTATION_FLAGS: &str =
+    r"(?:^|\s)(?:--vacuum|--rot|--fl|--syn|--rel|--sm|--set|--upd)";
 
 /// `sar`'s `-o <file>` writes its binary sample data to an arbitrary
 /// path, an arbitrary-file-write primitive wrapped in a monitoring tool
@@ -393,6 +445,38 @@ mod tests {
             vec!["-i0".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), "00".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), "0".to_string()],
+            // strtod-based parsing also accepts scientific-notation and
+            // hex spellings of zero, both of which still flood.
+            vec!["-i".to_string(), "0e0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0E0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0e+0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0e-0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "00e00".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0x0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0X0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0x00".to_string(), "8.8.8.8".to_string()],
+            vec!["-i0e0".to_string(), "8.8.8.8".to_string()],
+            vec!["-i0x0".to_string(), "8.8.8.8".to_string()],
+            // Clustered short-option form, consistent with how the file
+            // already tests clustering for this constant: `-ci0x0` is
+            // `-c -i 0x0` (flood interval clustered with count).
+            vec!["-ci0x0".to_string(), "8.8.8.8".to_string()],
+            vec!["-ci0e0".to_string(), "8.8.8.8".to_string()],
+            // A second adversarial pass found these still slipped through
+            // the first zero-interval fix, all `strtod`-zero, all flooding
+            // the same as `-i 0`.
+            vec!["-i".to_string(), "+0".to_string(), "8.8.8.8".to_string()],
+            // A non-zero exponent on a zero mantissa is still zero.
+            vec!["-i".to_string(), "0e5".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "0E9".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "+0e5".to_string(), "8.8.8.8".to_string()],
+            // C99 hex-float syntax: a binary exponent on a zero mantissa.
+            vec!["-i".to_string(), "0x0p0".to_string(), "8.8.8.8".to_string()],
+            vec![
+                "-i".to_string(),
+                "0X0P+3".to_string(),
+                "8.8.8.8".to_string(),
+            ],
             // Adaptive ping: paced to the round-trip time, which on a LAN
             // is flood ping under another name.
             vec!["-A".to_string(), "8.8.8.8".to_string()],
@@ -434,6 +518,13 @@ mod tests {
             // an all-zero value is a flood.
             vec!["-i".to_string(), "1".to_string(), "8.8.8.8".to_string()],
             vec!["-i".to_string(), "10".to_string(), "8.8.8.8".to_string()],
+            // A non-zero scientific-notation interval is an ordinary
+            // interval, not a flood, and must survive the new alternative.
+            vec!["-i".to_string(), "1e0".to_string(), "8.8.8.8".to_string()],
+            // A non-zero mantissa with a sign or an exponent is still an
+            // ordinary interval, not a flood: only a zero mantissa denies.
+            vec!["-i".to_string(), "+5".to_string(), "8.8.8.8".to_string()],
+            vec!["-i".to_string(), "5e0".to_string(), "8.8.8.8".to_string()],
             // Uppercase `-S` (sndbuf) is a different option from `-s`, and
             // the deny alternatives are case-sensitive.
             vec!["-S".to_string(), "1024".to_string(), "8.8.8.8".to_string()],
@@ -570,6 +661,24 @@ mod tests {
                     "--ho=evil.example".to_string(),
                     "sshd".to_string(),
                 ],
+                // --image/--image-policy redirect against a disk image
+                // rather than the running system, the same family --host/
+                // --machine/--root are already denied for.
+                vec![
+                    "status".to_string(),
+                    "--image=/path/to.raw".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--im=/path/to.raw".to_string(),
+                    "sshd".to_string(),
+                ],
+                vec![
+                    "status".to_string(),
+                    "--image-policy=root=verity".to_string(),
+                    "sshd".to_string(),
+                ],
             ] {
                 assert!(
                     matches!(engine.evaluate("systemctl", &denied), Decision::Denied(_)),
@@ -598,6 +707,14 @@ mod tests {
                 vec![
                     "status".to_string(),
                     "--type=service".to_string(),
+                    "sshd".to_string(),
+                ],
+                // A real systemctl long option sharing the `--i` prefix
+                // with --image, but diverging at the third letter, must
+                // survive the new --im prefix.
+                vec![
+                    "status".to_string(),
+                    "--ignore-dependencies".to_string(),
                     "sshd".to_string(),
                 ],
             ] {
@@ -714,6 +831,88 @@ mod tests {
                 "journalctl {allowed:?} should be allowed under the safe tier"
             );
         }
+    }
+
+    #[test]
+    fn standard_tier_denies_dnf_bypass_flags_at_token_start_but_allows_a_value_that_merely_contains_the_substring(
+    ) {
+        // The alternation is anchored to a `(?:^|\s)` token boundary, so a
+        // value that merely *contains* `--nog`/`--repof`/`--set` mid-token
+        // (rather than being the flag itself, at the start of a token) is no
+        // longer denied. Each of these actually matched the old bare
+        // substring pattern (verified by hand before writing this test), so
+        // this is a real false-positive fix, not a contrived case that
+        // never would have matched.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for allowed in [
+            vec!["install".to_string(), "foo--nogfoo".to_string()],
+            vec![
+                "install".to_string(),
+                "lib--repofrompath-compat".to_string(),
+            ],
+            vec!["install".to_string(), "mypkg--set=1".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &allowed), Decision::Allowed),
+                "dnf {allowed:?} should be allowed under the standard tier \
+                 (substring, not a token-start flag)"
+            );
+        }
+
+        // The anchored form still denies the real flags at a token start.
+        assert!(matches!(
+            engine.evaluate(
+                "dnf",
+                &["install".into(), "--nogpgcheck".into(), "foo".into()]
+            ),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_journalctl_flags_at_token_start_but_allows_a_value_that_merely_contains_the_substring(
+    ) {
+        // Same anchoring fix as the dnf constant above, applied to
+        // JOURNALCTL_MUTATION_FLAGS. Each of these actually matched the old
+        // bare substring pattern (verified by hand before writing this
+        // test).
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        for allowed in [
+            vec!["myunit--rotate".to_string()],
+            vec!["unit--flush".to_string()],
+            vec!["svc--syncme".to_string()],
+            vec!["abc--relinquish".to_string()],
+            vec!["x--smtest".to_string()],
+            vec!["y--setup-keys".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("journalctl", &allowed), Decision::Allowed),
+                "journalctl {allowed:?} should be allowed under the safe tier \
+                 (substring, not a token-start flag)"
+            );
+        }
+
+        // The anchored form still denies the real flags at a token start.
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--rotate".into()]),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_journalctl_update_catalog() {
+        // `--update-catalog` writes to `/var/lib/systemd/catalog`, the same
+        // "this mutates state" class the rest of JOURNALCTL_MUTATION_FLAGS
+        // closes, but it wasn't previously covered.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--update-catalog".into()]),
+            Decision::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate("journalctl", &["--upd".into()]),
+            Decision::Denied(_)
+        ));
     }
 
     #[test]

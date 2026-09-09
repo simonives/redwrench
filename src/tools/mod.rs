@@ -16,6 +16,14 @@ pub struct RedWrenchServer {
     pub timeout: Duration,
     pub max_stream_duration: Duration,
     pub tier_name: String,
+    /// `Some((uid, gid))` only when the active tier is `developer` and its
+    /// `developer_user` precondition resolved successfully at startup;
+    /// `None` under every other tier, including `unrestricted` (the
+    /// privilege drop is not inherited upward, see the design spec's
+    /// non-goals). `dispatch()` consults this to decide whether a given
+    /// call to a developer-tier tool should run under this identity
+    /// instead of root.
+    pub developer_identity: Option<(u32, u32)>,
     pub tool_router: ToolRouter<Self>,
 }
 
@@ -36,12 +44,14 @@ impl RedWrenchServer {
         timeout: Duration,
         tier_name: String,
         max_stream_duration: Duration,
+        developer_identity: Option<(u32, u32)>,
     ) -> Self {
         Self {
             policy,
             timeout,
             max_stream_duration,
             tier_name,
+            developer_identity,
             tool_router: Self::run_command_router()
                 + Self::systemctl_router()
                 + Self::dnf_router()
@@ -243,6 +253,7 @@ pub(crate) mod tests {
             timeout,
             "unrestricted".to_string(),
             Duration::from_secs(1800),
+            None,
         )
     }
 
@@ -252,6 +263,7 @@ pub(crate) mod tests {
             timeout,
             "safe".to_string(),
             Duration::from_secs(1800),
+            None,
         )
     }
 

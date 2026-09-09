@@ -200,6 +200,7 @@ mod tests {
             Duration::from_secs(5),
             "unrestricted".to_string(),
             Duration::from_secs(1800),
+            None,
         );
         let (ctx, _guard) = crate::tools::tests::test_request_context(&server);
 

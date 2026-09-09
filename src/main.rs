@@ -155,12 +155,16 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         );
     }
 
+    let developer_identity =
+        validate_developer_tier_precondition(&config.tier, &config.developer_user)?;
+
     let tier_name = format!("{:?}", config.tier).to_lowercase();
     let server = RedWrenchServer::new(
         Arc::new(policy::PolicyEngine::new(config.effective_rules())),
         Duration::from_secs(config.timeout_secs),
         tier_name,
         Duration::from_secs(config.max_stream_duration_secs),
+        developer_identity,
     );
 
     use rmcp::transport::streamable_http_server::{
@@ -280,7 +284,8 @@ mod tests {
 
     #[test]
     fn developer_tier_without_a_developer_user_is_rejected() {
-        let result = validate_developer_tier_precondition(&policy::tiers::TierName::Developer, &None);
+        let result =
+            validate_developer_tier_precondition(&policy::tiers::TierName::Developer, &None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("developer_user"));
     }

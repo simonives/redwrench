@@ -122,7 +122,8 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
 
     let http_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
-        .with_json_response(true);
+        .with_json_response(true)
+        .with_allowed_hosts(allowed_hosts_for(&config.bind_address));
 
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -143,4 +144,68 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     tracing::info!(target: "redwrench::audit", bind_address = %config.bind_address, "redwrench starting");
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// The Host headers `StreamableHttpServerConfig` accepts, as a DNS-rebinding
+/// defence: any request whose Host header doesn't match one of these is
+/// rejected with a 403, regardless of a valid bearer token.
+///
+/// NOTE (post-review fix, DNS-rebinding allowlist blocked every real
+/// client): rmcp's `StreamableHttpServerConfig::default()` only allows
+/// `localhost`/`127.0.0.1`/`::1`. RedWrench is designed to be bound to and
+/// reached over a non-loopback address (a Tailscale IP, typically), so the
+/// unmodified default silently made the server unreachable by the one
+/// client it actually exists to serve. This was never caught because every
+/// prior test and manual check happened over loopback. `bind_address` has
+/// already been proven to parse as a real `SocketAddr` by
+/// `auth::validate_bind_address` before this function is ever called, so its
+/// IP (host only, no port, matching any port on that host, see
+/// `host_is_allowed`'s port-matching rule) is added to the allowlist
+/// alongside the loopback defaults, keeping the defence-in-depth intact for
+/// any Host header that isn't either loopback or the server's own
+/// configured address.
+fn allowed_hosts_for(bind_address: &str) -> Vec<String> {
+    let bind_host = bind_address
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_default();
+
+    ["localhost", "127.0.0.1", "::1", bind_host.as_str()]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_hosts_includes_loopback_and_the_configured_bind_address() {
+        let hosts = allowed_hosts_for("100.64.0.1:8443");
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        assert!(hosts.contains(&"::1".to_string()));
+        assert!(
+            hosts.contains(&"100.64.0.1".to_string()),
+            "the server's own bind address must be an allowed Host, or every \
+             real remote client is rejected with a 403 before ever reaching \
+             the bearer-token check: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_for_an_ipv6_bind_address_does_not_include_the_port() {
+        // A port left attached to the host entry would never match, since
+        // rmcp's own default entries ("localhost", "127.0.0.1", "::1") are
+        // bare hosts too, and host_is_allowed compares host and port
+        // separately. This guards against a regression that re-adds the
+        // port (e.g. accidentally pushing `bind_address` itself, unparsed).
+        let hosts = allowed_hosts_for("[::1]:8443");
+        assert!(hosts.contains(&"::1".to_string()));
+        assert!(
+            !hosts.iter().any(|h| h.contains(':') && h.contains("8443")),
+            "the bind host entry must not carry the port: {hosts:?}"
+        );
+    }
 }

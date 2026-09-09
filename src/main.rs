@@ -114,6 +114,8 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         Duration::from_secs(config.timeout_secs),
         tier_name,
         Duration::from_secs(config.max_stream_duration_secs),
+        config.tier.clone(),
+        config.custom_rules.clone(),
     );
 
     use rmcp::transport::streamable_http_server::{

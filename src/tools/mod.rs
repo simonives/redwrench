@@ -1,4 +1,5 @@
-use crate::policy::{Decision, PolicyEngine};
+use crate::policy::tiers::TierName;
+use crate::policy::{Decision, PolicyEngine, Rule};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool_handler, ServerHandler};
@@ -16,6 +17,8 @@ pub struct RedWrenchServer {
     pub timeout: Duration,
     pub max_stream_duration: Duration,
     pub tier_name: String,
+    pub tier: TierName,
+    pub custom_rules: std::sync::Arc<Vec<Rule>>,
     pub tool_router: ToolRouter<Self>,
 }
 
@@ -36,12 +39,16 @@ impl RedWrenchServer {
         timeout: Duration,
         tier_name: String,
         max_stream_duration: Duration,
+        tier: TierName,
+        custom_rules: Vec<Rule>,
     ) -> Self {
         Self {
             policy,
             timeout,
             max_stream_duration,
             tier_name,
+            tier,
+            custom_rules: std::sync::Arc::new(custom_rules),
             tool_router: Self::run_command_router()
                 + Self::systemctl_router()
                 + Self::dnf_router()
@@ -244,6 +251,8 @@ pub(crate) mod tests {
             timeout,
             "unrestricted".to_string(),
             Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Unrestricted,
+            vec![],
         )
     }
 
@@ -253,6 +262,8 @@ pub(crate) mod tests {
             timeout,
             "safe".to_string(),
             Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Safe,
+            vec![],
         )
     }
 

@@ -168,10 +168,36 @@ async fn drain_after_kill(
     (truncate_output(stdout_data), truncate_output(stderr_data))
 }
 
+/// The OS identity a developer-tier command runs under, instead of
+/// RedWrench's own (root) identity. Resolved once at startup from
+/// `config.developer_user` and carried unchanged from there to the
+/// `Command` builder.
+///
+/// It carries more than `(uid, gid)` deliberately. A process running under
+/// a different uid but still inheriting root's `HOME`, `USER`, `LOGNAME`
+/// and working directory is not a usable development environment: `~`
+/// expands to an unwritable `/root`, `npm` targets `/root/.npm`, `cargo`
+/// targets `/root/.cargo`, and relative paths resolve against whatever
+/// directory the service happened to start in. The design spec puts a
+/// natural development experience (existing dotfiles and tooling config
+/// reachable, package installation in scope) explicitly in scope, so the
+/// account's own name and home directory travel with its uid/gid rather
+/// than being discarded at resolution time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeveloperIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    /// The account's login name, used for the child's `USER` and `LOGNAME`.
+    pub name: String,
+    /// The account's home directory, used for the child's `HOME` and its
+    /// working directory.
+    pub home: std::path::PathBuf,
+}
+
 /// Runs `command` with `args` as an argv vector (never through a shell),
 /// bounded by `timeout`, optionally cancellable, optionally streaming each
 /// output chunk to `chunk_sink` as it arrives, optionally spawned under a
-/// different `(uid, gid)` than RedWrench's own (the `developer` tier's
+/// different identity than RedWrench's own (the `developer` tier's
 /// privilege-drop mechanism, see `policy::tiers::DEVELOPER_TOOLS`).
 ///
 /// Kills the spawned process on timeout via `kill_on_drop` plus an
@@ -194,14 +220,37 @@ pub async fn execute(
     timeout: Duration,
     cancellation: Option<tokio_util::sync::CancellationToken>,
     chunk_sink: Option<ChunkSink>,
-    run_as: Option<(u32, u32)>,
+    run_as: Option<DeveloperIdentity>,
 ) -> ExecutionResult {
     let mut cmd = Command::new(command);
     cmd.args(args)
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some((uid, gid)) = run_as {
+    if let Some(DeveloperIdentity {
+        uid,
+        gid,
+        ref name,
+        ref home,
+    }) = run_as
+    {
+        // Environment and working directory, so the dropped process gets
+        // the account's own context rather than root's. Without this the
+        // child runs under the developer_user's uid while `$HOME` still
+        // says `/root`, which breaks `~` expansion and sends every tool
+        // that caches under `$HOME` (npm, cargo) at a directory the child
+        // cannot write.
+        //
+        // std applies `current_dir` in the forked child *after* the
+        // uid/gid it was configured with but *before* any `pre_exec`
+        // closure, and the drop below happens entirely inside that closure,
+        // so the `chdir` still runs as root and cannot fail on a home
+        // directory the account itself could not traverse.
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USER", name)
+            .env("LOGNAME", name);
+
         // The whole privilege drop happens here in one `pre_exec` closure
         // rather than through `Command::uid`/`Command::gid`, because the
         // supplementary group list has to be cleared *first* and the
@@ -227,6 +276,13 @@ pub async fn execute(
         // `io::Error` from a raw errno. It allocates nothing, takes no
         // locks, touches no shared state, and captures only two `u32`s by
         // copy, so it is safe to run in that context.
+        // The crate denies `unsafe_code` at the manifest level
+        // (`[lints.rust]` in Cargo.toml). This is its sole intentional
+        // exception: there is no safe API for the ordering this drop
+        // requires, and the SAFETY note above states why this particular
+        // closure is sound in a forked child. Any second `unsafe` block
+        // added to this crate should have to justify itself the same way.
+        #[allow(unsafe_code)]
         unsafe {
             cmd.pre_exec(move || {
                 nix::unistd::setgroups(&[]).map_err(std::io::Error::from)?;
@@ -367,6 +423,26 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Resolves a real account from the test machine's passwd database into
+    /// a `DeveloperIdentity`, mirroring what `main.rs`'s `resolve_user` does
+    /// at startup. Resolved dynamically rather than hardcoding numbers or
+    /// paths, since those are conventions, not guarantees.
+    fn identity_for(username: &str) -> DeveloperIdentity {
+        let user = nix::unistd::User::from_name(username)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{username}' must exist on the Fedora test environment this project requires"
+                )
+            });
+        DeveloperIdentity {
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            name: user.name,
+            home: user.dir,
+        }
+    }
+
     #[tokio::test]
     async fn run_as_drops_privilege_to_the_given_uid_and_gid() {
         // "nobody" exists on every Fedora system (this project's own
@@ -375,10 +451,8 @@ mod tests {
         // "dropped" from "still root". Resolved dynamically rather than
         // hardcoding a numeric uid, since that number is a convention, not a
         // guarantee.
-        let user = nix::unistd::User::from_name("nobody")
-            .unwrap()
-            .expect("'nobody' must exist on the Fedora test environment this project requires");
-        let (uid, gid) = (user.uid.as_raw(), user.gid.as_raw());
+        let identity = identity_for("nobody");
+        let (uid, gid) = (identity.uid, identity.gid);
         assert_ne!(uid, 0, "test is meaningless if 'nobody' resolved to root");
 
         let result = execute(
@@ -387,7 +461,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
-            Some((uid, gid)),
+            Some(identity.clone()),
         )
         .await;
 
@@ -408,7 +482,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
-            Some((uid, gid)),
+            Some(identity.clone()),
         )
         .await;
 
@@ -430,7 +504,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
-            Some((uid, gid)),
+            Some(identity.clone()),
         )
         .await;
 
@@ -444,6 +518,61 @@ mod tests {
             vec![gid.to_string()],
             "the spawned process must belong to exactly the dropped gid, with no \
              supplementary groups inherited from RedWrench (root)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_as_gives_the_child_the_account_s_own_home_environment_and_cwd() {
+        // "daemon" is used rather than "nobody" because its home (`/sbin`)
+        // is a distinctive real path: "nobody"'s home is `/` on Fedora,
+        // which is also a plausible accidental default, so it could not
+        // tell a working implementation from a broken one.
+        let identity = identity_for("daemon");
+        assert_ne!(identity.uid, 0, "test is meaningless if 'daemon' is root");
+        let home = identity.home.display().to_string();
+        assert_ne!(
+            home, "/root",
+            "test is meaningless if the fixture account shares root's home"
+        );
+
+        let result = execute(
+            "sh",
+            &[
+                "-c".to_string(),
+                "echo \"$HOME\"; echo \"$USER\"; echo \"$LOGNAME\"; pwd".to_string(),
+            ],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some(identity.clone()),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                home.as_str(),
+                identity.name.as_str(),
+                identity.name.as_str()
+            ],
+            "the dropped child must see the account's own HOME/USER/LOGNAME, not \
+             inherit root's while running under a different uid: {:?}",
+            result.stdout
+        );
+
+        // `pwd` reports the physical path, and Fedora's usrmerge makes several
+        // conventional home directories symlinks (`/sbin` -> `/usr/bin`), so
+        // both sides are canonicalised before comparison rather than asserting
+        // the literal passwd string.
+        let expected_cwd = std::fs::canonicalize(&identity.home).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(lines[3]).unwrap(),
+            expected_cwd,
+            "the dropped child must start in the account's home directory, not \
+             whatever directory RedWrench itself was started in: {:?}",
+            result.stdout
         );
     }
 

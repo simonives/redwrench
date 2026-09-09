@@ -16,14 +16,14 @@ pub struct RedWrenchServer {
     pub timeout: Duration,
     pub max_stream_duration: Duration,
     pub tier_name: String,
-    /// `Some((uid, gid))` only when the active tier is `developer` and its
+    /// `Some(identity)` only when the active tier is `developer` and its
     /// `developer_user` precondition resolved successfully at startup;
     /// `None` under every other tier, including `unrestricted` (the
     /// privilege drop is not inherited upward, see the design spec's
     /// non-goals). `dispatch()` consults this to decide whether a given
     /// call to a developer-tier tool should run under this identity
     /// instead of root.
-    pub developer_identity: Option<(u32, u32)>,
+    pub developer_identity: Option<crate::executor::DeveloperIdentity>,
     pub tool_router: ToolRouter<Self>,
 }
 
@@ -44,7 +44,7 @@ impl RedWrenchServer {
         timeout: Duration,
         tier_name: String,
         max_stream_duration: Duration,
-        developer_identity: Option<(u32, u32)>,
+        developer_identity: Option<crate::executor::DeveloperIdentity>,
     ) -> Self {
         Self {
             policy,
@@ -190,6 +190,7 @@ impl RedWrenchServer {
                 // no separate tier-name comparison needed here).
                 let run_as = self
                     .developer_identity
+                    .clone()
                     .filter(|_| crate::policy::tiers::DEVELOPER_TOOLS.contains(&command));
 
                 let result = crate::executor::execute(
@@ -278,7 +279,26 @@ pub(crate) mod tests {
         )
     }
 
-    fn developer_tier_server(timeout: Duration, developer_identity: (u32, u32)) -> RedWrenchServer {
+    fn developer_identity_for(username: &str) -> crate::executor::DeveloperIdentity {
+        let user = nix::unistd::User::from_name(username)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{username}' must exist on the Fedora test environment this project requires"
+                )
+            });
+        crate::executor::DeveloperIdentity {
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            name: user.name,
+            home: user.dir,
+        }
+    }
+
+    fn developer_tier_server(
+        timeout: Duration,
+        developer_identity: crate::executor::DeveloperIdentity,
+    ) -> RedWrenchServer {
         RedWrenchServer::new(
             std::sync::Arc::new(PolicyEngine::new(crate::policy::tiers::rules_for_tier(
                 &crate::policy::tiers::TierName::Developer,
@@ -327,12 +347,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dispatch_drops_privilege_for_a_developer_tool_call() {
-        let user = nix::unistd::User::from_name("nobody")
-            .unwrap()
-            .expect("'nobody' must exist on the Fedora test environment this project requires");
-        let (uid, gid) = (user.uid.as_raw(), user.gid.as_raw());
+        let identity = developer_identity_for("nobody");
+        let uid = identity.uid;
 
-        let server = developer_tier_server(Duration::from_secs(5), (uid, gid));
+        let server = developer_tier_server(Duration::from_secs(5), identity);
         let (ctx, _guard) = test_request_context(&server);
         let result = server
             .dispatch(
@@ -367,7 +385,8 @@ pub(crate) mod tests {
         // itself observe "ran as root" without a real systemctl target on the
         // test machine, that is what the run_as_drops_privilege tests in
         // executor.rs already cover for the mechanism itself.
-        let server = developer_tier_server(Duration::from_secs(5), (65534, 65534));
+        let server =
+            developer_tier_server(Duration::from_secs(5), developer_identity_for("nobody"));
         let (ctx, _guard) = test_request_context(&server);
         let result = server
             .dispatch(

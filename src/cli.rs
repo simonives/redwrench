@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 pub enum TierName {
     Safe,
     Standard,
+    Developer,
     Unrestricted,
 }
 
@@ -73,6 +74,24 @@ mod tests {
                     },
             }) => {
                 assert_eq!(tier, TierName::Unrestricted); // cli::TierName, not policy::tiers::TierName
+                assert!(!i_understand_the_risk);
+            }
+            _ => panic!("expected Config(SetTier) command"),
+        }
+    }
+
+    #[test]
+    fn set_tier_developer_parses_without_requiring_the_risk_flag() {
+        let cli = Cli::try_parse_from(["redwrench", "config", "set-tier", "developer"]).unwrap();
+        match cli.command {
+            Some(Command::Config {
+                command:
+                    ConfigCommand::SetTier {
+                        tier,
+                        i_understand_the_risk,
+                    },
+            }) => {
+                assert_eq!(tier, TierName::Developer);
                 assert!(!i_understand_the_risk);
             }
             _ => panic!("expected Config(SetTier) command"),

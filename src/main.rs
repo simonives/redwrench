@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
             let tier = match tier {
                 cli::TierName::Safe => policy::tiers::TierName::Safe,
                 cli::TierName::Standard => policy::tiers::TierName::Standard,
+                cli::TierName::Developer => policy::tiers::TierName::Developer,
                 cli::TierName::Unrestricted => policy::tiers::TierName::Unrestricted,
             };
             if matches!(tier, policy::tiers::TierName::Unrestricted) && !i_understand_the_risk {
@@ -56,6 +57,7 @@ fn update_tier_in_config(
     let tier_str = match tier {
         policy::tiers::TierName::Safe => "safe",
         policy::tiers::TierName::Standard => "standard",
+        policy::tiers::TierName::Developer => "developer",
         policy::tiers::TierName::Unrestricted => "unrestricted",
     };
     value

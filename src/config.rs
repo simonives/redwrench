@@ -46,6 +46,15 @@ struct RawConfig {
     /// calls. Optional; defaults to [`DEFAULT_MAX_STREAM_DURATION_SECS`].
     #[serde(default)]
     max_stream_duration_secs: Option<u64>,
+    /// Required when `tier` is `developer` (or higher). The OS username
+    /// developer-tier tool execution runs as instead of root. Validated
+    /// at server startup (see `src/main.rs`), not here: this struct only
+    /// parses the config's shape, cross-cutting tier preconditions are
+    /// checked at the point the tier is actually turned into a running
+    /// server, matching how the `unrestricted` tier's CLI-flag
+    /// requirement is already checked in `main.rs`, not in `Config::load`.
+    #[serde(default)]
+    developer_user: Option<String>,
 }
 
 #[derive(Debug)]
@@ -58,6 +67,7 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Resolved safety-net duration in seconds, already defaulted.
     pub max_stream_duration_secs: u64,
+    pub developer_user: Option<String>,
 }
 
 impl Config {
@@ -74,6 +84,7 @@ impl Config {
                         match raw.tier {
                             TierName::Safe => "safe",
                             TierName::Standard => "standard",
+                            TierName::Developer => "developer",
                             TierName::Unrestricted => "unrestricted",
                         }
                     );
@@ -106,6 +117,7 @@ impl Config {
             max_stream_duration_secs: raw
                 .max_stream_duration_secs
                 .unwrap_or(DEFAULT_MAX_STREAM_DURATION_SECS),
+            developer_user: raw.developer_user,
         })
     }
 
@@ -374,5 +386,32 @@ mod tests {
         );
         let config = Config::load(file.path()).unwrap();
         assert_eq!(config.max_stream_duration_secs, 300);
+    }
+
+    #[test]
+    fn developer_user_is_read_from_the_config_when_present() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "developer"
+            developer_user = "macgyver"
+            "#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.developer_user.as_deref(), Some("macgyver"));
+    }
+
+    #[test]
+    fn developer_user_defaults_to_none_when_absent() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "safe"
+            "#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.developer_user, None);
     }
 }

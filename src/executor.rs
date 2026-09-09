@@ -202,7 +202,41 @@ pub async fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some((uid, gid)) = run_as {
-        cmd.uid(uid).gid(gid);
+        // The whole privilege drop happens here in one `pre_exec` closure
+        // rather than through `Command::uid`/`Command::gid`, because the
+        // supplementary group list has to be cleared *first* and the
+        // builder cannot express that ordering.
+        //
+        // `setgid`/`setuid` alone leave the child carrying every
+        // supplementary group RedWrench (root) belonged to, which is
+        // residual privilege the developer tier exists to remove. Clearing
+        // them needs CAP_SETGID, so it must happen while the child is still
+        // effectively root, i.e. before `setuid`. std runs `pre_exec`
+        // closures *after* it applies `.uid()`/`.gid()`, so pairing
+        // `.uid()`/`.gid()` with a `setgroups` closure fails at spawn with
+        // EPERM (verified empirically on Fedora, not assumed). Doing all
+        // three calls ourselves, in order, is the only way to get it right,
+        // and it also makes each step's failure loud rather than ignored.
+        // (`pre_exec` is an inherent method on `tokio::process::Command`
+        // here, so no `CommandExt` import is needed.)
+        //
+        // SAFETY: `pre_exec` runs in the forked child between `fork()` and
+        // `exec()`, where only async-signal-safe work is sound. The closure
+        // does nothing but issue three syscalls (`setgroups`, `setgid`,
+        // `setuid`) through nix's thin wrappers and, on failure, build an
+        // `io::Error` from a raw errno. It allocates nothing, takes no
+        // locks, touches no shared state, and captures only two `u32`s by
+        // copy, so it is safe to run in that context.
+        unsafe {
+            cmd.pre_exec(move || {
+                nix::unistd::setgroups(&[]).map_err(std::io::Error::from)?;
+                nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
+                    .map_err(std::io::Error::from)?;
+                nix::unistd::setuid(nix::unistd::Uid::from_raw(uid))
+                    .map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -363,6 +397,53 @@ mod tests {
             uid.to_string(),
             "the spawned process's own reported uid must match the dropped identity, \
              not RedWrench's (root's) uid"
+        );
+
+        // The gid is the other half of the permissions guarantee: an
+        // implementation that got the uid right and the gid wrong (or
+        // omitted it) would still pass the assertion above.
+        let result = execute(
+            "id",
+            &["-g".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some((uid, gid)),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.stdout.trim(),
+            gid.to_string(),
+            "the spawned process's own reported gid must match the dropped identity, \
+             not RedWrench's (root's) gid"
+        );
+
+        // `id -G` lists the effective gid plus every supplementary group.
+        // Asserting it is *exactly* the dropped gid and nothing else proves
+        // the supplementary group list was cleared, so the child carries no
+        // residual membership inherited from root.
+        let result = execute(
+            "id",
+            &["-G".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some((uid, gid)),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result
+                .stdout
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            vec![gid.to_string()],
+            "the spawned process must belong to exactly the dropped gid, with no \
+             supplementary groups inherited from RedWrench (root)"
         );
     }
 

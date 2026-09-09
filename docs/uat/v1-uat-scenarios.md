@@ -227,3 +227,12 @@ argv vectors end-to-end. Run all three:
 3. Ask the connected agent "would `dnf list installed` be allowed?" and
    confirm it answers from this tool rather than attempting the real
    command to find out.
+
+## Scenario 17: a real denial names the tier that would allow it
+
+1. With `tier = "safe"`, call `run_command` with
+   `{"command": "dnf", "args": ["install", "htop"]}`.
+2. **Expected:** the denial message includes `would be allowed at:
+   standard`.
+3. Switch to `standard` tier, restart, repeat the same call.
+   **Expected:** it succeeds; no denial message to check.

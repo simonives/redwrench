@@ -108,8 +108,21 @@ impl RedWrenchServer {
                     None,
                     &request_id,
                 );
+                let suggestion = crate::policy::introspection::lowest_tier_that_would_allow(
+                    command,
+                    &args,
+                    &self.custom_rules,
+                    &self.tier,
+                )
+                .map(|t| {
+                    format!(
+                        "; would be allowed at: {}",
+                        crate::policy::tiers::tier_display_name(&t)
+                    )
+                })
+                .unwrap_or_default();
                 CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Denied: {reason} (active tier: {})",
+                    "Denied: {reason} (active tier: {}{suggestion})",
                     self.tier_name
                 ))])
             }
@@ -325,6 +338,70 @@ pub(crate) mod tests {
             text.contains("active tier: safe"),
             "unexpected text: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_denial_message_names_the_tier_that_would_allow_it() {
+        let server = RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(crate::policy::tiers::rules_for_tier(
+                &crate::policy::tiers::TierName::Safe,
+            ))),
+            Duration::from_secs(5),
+            "safe".to_string(),
+            Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Safe,
+            vec![],
+        );
+        let (ctx, _guard) = test_request_context(&server);
+        // dnf is not in safe_rules() at all, but standard_rules() adds it.
+        let result = server
+            .dispatch(
+                "dnf_install",
+                "dnf",
+                vec!["install".to_string(), "htop".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+        let text = text_of(&result);
+        assert!(
+            text.contains("would be allowed at: standard"),
+            "got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_denial_message_has_no_suggestion_when_no_tier_would_allow_it() {
+        let custom = vec![Rule {
+            command: "dnf".to_string(),
+            arg_pattern: None,
+            effect: Effect::Deny,
+            description: "custom: never allow dnf".to_string(),
+        }];
+        let mut rules = custom.clone();
+        rules.extend(crate::policy::tiers::rules_for_tier(
+            &crate::policy::tiers::TierName::Safe,
+        ));
+        let server = RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(rules)),
+            Duration::from_secs(5),
+            "safe".to_string(),
+            Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Safe,
+            custom,
+        );
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "dnf_install",
+                "dnf",
+                vec!["install".to_string(), "htop".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+        let text = text_of(&result);
+        assert!(!text.contains("would be allowed at"), "got: {text}");
     }
 
     #[tokio::test]

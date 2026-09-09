@@ -14,8 +14,15 @@ path = "src/lib.rs"
 name = "redwrench"
 path = "src/main.rs"
 
+[lints.rust]
+# This crate is a privileged process spawner, so `unsafe` is denied by
+# default and each exception has to be granted explicitly at its site.
+# There is exactly one today: the privilege-drop `pre_exec` closure in
+# `src/executor.rs`, which carries its own SAFETY note and `#[allow]`.
+unsafe_code = "deny"
+
 [dependencies]
-rmcp = { version = "3.0", features = ["server", "transport-streamable-http-server"] }
+rmcp ={ version = "3.0", features = ["server", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = "0.7"

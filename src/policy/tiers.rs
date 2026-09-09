@@ -6,6 +6,7 @@ use regex::Regex;
 pub enum TierName {
     Safe,
     Standard,
+    Developer,
     Unrestricted,
 }
 
@@ -303,10 +304,31 @@ fn standard_rules() -> Vec<Rule> {
     rules
 }
 
+/// Interpreters, compilers, and build tools unlocked by the `developer`
+/// tier. Each is allowed unconditionally (no `arg_pattern`): there is no
+/// useful subset of "safe bash scripts" or "safe compiler flags"
+/// expressible as a regex the way "safe `ip` subcommands" is, and
+/// attempting one would be an illusion of safety a few characters of
+/// obfuscation defeats. The actual safety mechanism for this tier is the
+/// privilege drop in `dispatch()`/`execute()` (see `RedWrenchServer`'s
+/// `developer_identity` field and `src/executor.rs`'s `run_as`
+/// parameter): whatever these tools do, they do it as the configured
+/// `developer_user`, not as root, so the guarantee is ordinary Unix
+/// permissions, not command filtering.
+pub const DEVELOPER_TOOLS: &[&str] =
+    &["bash", "sh", "python3", "gcc", "cc", "node", "npm", "cargo", "make"];
+
+fn developer_rules() -> Vec<Rule> {
+    let mut rules = standard_rules();
+    rules.extend(DEVELOPER_TOOLS.iter().map(|tool| allow(tool, None)));
+    rules
+}
+
 pub fn rules_for_tier(tier: &TierName) -> Vec<Rule> {
     match tier {
         TierName::Safe => safe_rules(),
         TierName::Standard => standard_rules(),
+        TierName::Developer => developer_rules(),
         TierName::Unrestricted => vec![Rule {
             command: String::new(),
             arg_pattern: None,
@@ -1000,6 +1022,60 @@ mod tests {
         ));
         assert!(matches!(
             engine.evaluate("journalctl", &["--setup-keys".into()]),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn developer_tier_allows_each_developer_tool_unconditionally() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Developer));
+        for tool in DEVELOPER_TOOLS {
+            assert!(
+                matches!(engine.evaluate(tool, &["--version".into()]), Decision::Allowed),
+                "{tool} should be allowed under the developer tier"
+            );
+            // No argument restriction at all: an arbitrary-looking argument
+            // must not be denied either, since the privilege drop, not
+            // argument filtering, is this tier's safety mechanism.
+            assert!(
+                matches!(
+                    engine.evaluate(tool, &["-c".into(), "whatever this is".into()]),
+                    Decision::Allowed
+                ),
+                "{tool} must not have any argument restriction under developer"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_and_standard_tiers_still_deny_every_developer_tool() {
+        for tier in [TierName::Safe, TierName::Standard] {
+            let engine = PolicyEngine::new(rules_for_tier(&tier));
+            for tool in DEVELOPER_TOOLS {
+                assert!(
+                    matches!(engine.evaluate(tool, &[]), Decision::Denied(_)),
+                    "{tool} must still be denied under {tier:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn developer_tier_inherits_every_standard_tier_allowance() {
+        // developer_rules() must extend standard_rules(), not replace it:
+        // service control and package management stay available.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Developer));
+        assert!(matches!(
+            engine.evaluate("systemctl", &["restart".into(), "sshd".into()]),
+            Decision::Allowed
+        ));
+        assert!(matches!(
+            engine.evaluate("dnf", &["install".into(), "-y".into(), "htop".into()]),
+            Decision::Allowed
+        ));
+        // And standard's own hardening (dnf trust-bypass flags) still applies.
+        assert!(matches!(
+            engine.evaluate("dnf", &["install".into(), "--nogpgcheck".into(), "htop".into()]),
             Decision::Denied(_)
         ));
     }

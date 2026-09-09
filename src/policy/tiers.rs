@@ -315,8 +315,9 @@ fn standard_rules() -> Vec<Rule> {
 /// parameter): whatever these tools do, they do it as the configured
 /// `developer_user`, not as root, so the guarantee is ordinary Unix
 /// permissions, not command filtering.
-pub const DEVELOPER_TOOLS: &[&str] =
-    &["bash", "sh", "python3", "gcc", "cc", "node", "npm", "cargo", "make"];
+pub const DEVELOPER_TOOLS: &[&str] = &[
+    "bash", "sh", "python3", "gcc", "cc", "node", "npm", "cargo", "make",
+];
 
 fn developer_rules() -> Vec<Rule> {
     let mut rules = standard_rules();
@@ -1031,7 +1032,10 @@ mod tests {
         let engine = PolicyEngine::new(rules_for_tier(&TierName::Developer));
         for tool in DEVELOPER_TOOLS {
             assert!(
-                matches!(engine.evaluate(tool, &["--version".into()]), Decision::Allowed),
+                matches!(
+                    engine.evaluate(tool, &["--version".into()]),
+                    Decision::Allowed
+                ),
                 "{tool} should be allowed under the developer tier"
             );
             // No argument restriction at all: an arbitrary-looking argument
@@ -1075,7 +1079,10 @@ mod tests {
         ));
         // And standard's own hardening (dnf trust-bypass flags) still applies.
         assert!(matches!(
-            engine.evaluate("dnf", &["install".into(), "--nogpgcheck".into(), "htop".into()]),
+            engine.evaluate(
+                "dnf",
+                &["install".into(), "--nogpgcheck".into(), "htop".into()]
+            ),
             Decision::Denied(_)
         ));
     }

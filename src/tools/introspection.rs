@@ -163,11 +163,14 @@ mod tests {
 
     #[tokio::test]
     async fn check_command_reports_allowed_with_no_reason_or_suggestion() {
+        // (issue #26) A bare, unscoped journalctl call is no longer
+        // allowed under `safe`, so this "genuinely allowed" fixture uses a
+        // real unit scope instead.
         let server = server_at(TierName::Safe, "safe");
         let result = server
             .check_command(Parameters(CheckCommandParams {
                 command: "journalctl".to_string(),
-                args: vec![],
+                args: vec!["-u".to_string(), "sshd".to_string()],
             }))
             .await;
         let text = super::super::tests::text_of(&result);

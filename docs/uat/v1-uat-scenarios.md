@@ -236,3 +236,13 @@ argv vectors end-to-end. Run all three:
    standard`.
 3. Switch to `standard` tier, restart, repeat the same call.
    **Expected:** it succeeds; no denial message to check.
+
+## Scenario 18: README and ARCHITECTURE are reachable as MCP resources
+
+1. Connect with an MCP client that supports the resources capability
+   (e.g. Claude Desktop).
+2. List available resources.
+   **Expected:** `readme` and `architecture` both appear.
+3. Read the `readme` resource.
+   **Expected:** the real README content, matching the repository's
+   `README.md` at the commit the running binary was built from.

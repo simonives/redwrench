@@ -244,8 +244,73 @@ impl RedWrenchServer {
     }
 }
 
+const README: &str = include_str!("../../README.md");
+const ARCHITECTURE: &str = include_str!("../../ARCHITECTURE.md");
+
+const README_URI: &str = "redwrench://docs/readme";
+const ARCHITECTURE_URI: &str = "redwrench://docs/architecture";
+
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for RedWrenchServer {}
+impl ServerHandler for RedWrenchServer {
+    // NOTE (rmcp API adaptation): the task brief's plan assumed a version of
+    // `rmcp::model::ServerInfo` (an alias for `InitializeResult`) that could
+    // be built with `ServerInfo { capabilities: ..., ..Default::default() }`.
+    // The pinned rmcp 3.2.0 marks `InitializeResult` `#[non_exhaustive]`, so
+    // that struct-update syntax no longer compiles from outside the crate;
+    // its own `InitializeResult::new(capabilities)` constructor is the
+    // supported route to the same result.
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::ErrorData> {
+        Ok(rmcp::model::ListResourcesResult::with_all_items(vec![
+            rmcp::model::Resource::new(README_URI, "readme")
+                .with_description(
+                    "RedWrench's README: what it is, how to install and configure it, \
+                     and its tool catalogue.",
+                )
+                .with_mime_type("text/markdown"),
+            rmcp::model::Resource::new(ARCHITECTURE_URI, "architecture")
+                .with_description(
+                    "RedWrench's architecture document: the policy engine, executor, \
+                     and tier model.",
+                )
+                .with_mime_type("text/markdown"),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        let contents = match request.uri.as_str() {
+            README_URI => rmcp::model::ResourceContents::text(README, &request.uri)
+                .with_mime_type("text/markdown"),
+            ARCHITECTURE_URI => rmcp::model::ResourceContents::text(ARCHITECTURE, &request.uri)
+                .with_mime_type("text/markdown"),
+            other => {
+                return Err(rmcp::ErrorData::resource_not_found(
+                    format!("no such resource: {other}"),
+                    None,
+                ))
+            }
+        };
+        Ok(rmcp::model::ReadResourceResponse::Complete(
+            rmcp::model::ReadResourceResult::new(vec![contents]),
+        ))
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -315,6 +380,46 @@ pub(crate) mod tests {
             .map(|t| t.text.clone())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[tokio::test]
+    async fn readme_resource_matches_the_real_file_on_disk() {
+        let server = allow_all_server(Duration::from_secs(5));
+        let real = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"),
+        )
+        .unwrap();
+        let (ctx, _guard) = test_request_context(&server);
+        let response = server
+            .read_resource(
+                rmcp::model::ReadResourceRequestParams::new(super::README_URI),
+                ctx,
+            )
+            .await
+            .unwrap();
+        let result = match response {
+            rmcp::model::ReadResourceResponse::Complete(r) => r,
+            other => panic!("expected a complete response, got {other:?}"),
+        };
+        match &result.contents[0] {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                assert_eq!(text, &real)
+            }
+            other => panic!("expected text contents, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_resource_rejects_an_unknown_uri() {
+        let server = allow_all_server(Duration::from_secs(5));
+        let (ctx, _guard) = test_request_context(&server);
+        let response = server
+            .read_resource(
+                rmcp::model::ReadResourceRequestParams::new("redwrench://docs/nonexistent"),
+                ctx,
+            )
+            .await;
+        assert!(response.is_err());
     }
 
     #[tokio::test]

@@ -122,6 +122,22 @@ fn validate_developer_tier_precondition(
              resolved: {err}"
         )
     })?;
+    // A developer_user that resolves to uid 0 is the one value that makes
+    // this tier a silent no-op: every precondition passes, the tier reports
+    // itself as 'developer', and every developer-tier command still runs as
+    // root, which is the exact outcome the tier exists to prevent. Refuse it
+    // at startup, the same posture as every other precondition failure on
+    // this path, rather than warning and starting anyway.
+    if identity.uid == 0 {
+        anyhow::bail!(
+            "config specifies the 'developer' policy tier with \
+             developer_user = \"{username}\", but that account resolves to \
+             uid 0 (root). The entire safety mechanism of this tier is \
+             running developer-tier commands as a non-root account, so \
+             dropping privilege to root would make it a no-op. Refusing to \
+             start. Set 'developer_user' to a regular, unprivileged account."
+        );
+    }
     Ok(Some(identity))
 }
 
@@ -333,6 +349,25 @@ mod tests {
                 name: "nobody".to_string(),
                 home: expected.dir,
             })
+        );
+    }
+
+    #[test]
+    fn developer_tier_with_root_as_the_developer_user_is_rejected() {
+        // The failure this guards is silent, not loud: "root" resolves
+        // perfectly well, so without an explicit uid 0 check the server
+        // starts, reports tier 'developer', and runs every developer-tier
+        // command as root anyway, with the safety mechanism a no-op and
+        // nothing anywhere saying so.
+        let result = validate_developer_tier_precondition(
+            &policy::tiers::TierName::Developer,
+            &Some("root".to_string()),
+        );
+        let err = result.expect_err("a developer_user resolving to uid 0 must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("uid 0") && message.contains("root"),
+            "the error must say plainly that the account resolves to root: {message}"
         );
     }
 

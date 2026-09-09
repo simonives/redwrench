@@ -1,10 +1,12 @@
-use crate::policy::{Decision, PolicyEngine};
+use crate::policy::tiers::TierName;
+use crate::policy::{Decision, PolicyEngine, Rule};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool_handler, ServerHandler};
 use std::time::Duration;
 
 pub mod dnf;
+pub mod introspection;
 pub mod journalctl;
 pub mod network;
 pub mod run_command;
@@ -16,6 +18,8 @@ pub struct RedWrenchServer {
     pub timeout: Duration,
     pub max_stream_duration: Duration,
     pub tier_name: String,
+    pub tier: TierName,
+    pub custom_rules: std::sync::Arc<Vec<Rule>>,
     pub tool_router: ToolRouter<Self>,
 }
 
@@ -36,17 +40,22 @@ impl RedWrenchServer {
         timeout: Duration,
         tier_name: String,
         max_stream_duration: Duration,
+        tier: TierName,
+        custom_rules: Vec<Rule>,
     ) -> Self {
         Self {
             policy,
             timeout,
             max_stream_duration,
             tier_name,
+            tier,
+            custom_rules: std::sync::Arc::new(custom_rules),
             tool_router: Self::run_command_router()
                 + Self::systemctl_router()
                 + Self::dnf_router()
                 + Self::journalctl_router()
-                + Self::network_router(),
+                + Self::network_router()
+                + Self::introspection_router(),
         }
     }
 
@@ -99,8 +108,21 @@ impl RedWrenchServer {
                     None,
                     &request_id,
                 );
+                let suggestion = crate::policy::introspection::lowest_tier_that_would_allow(
+                    command,
+                    &args,
+                    &self.custom_rules,
+                    &self.tier,
+                )
+                .map(|t| {
+                    format!(
+                        "; would be allowed at: {}",
+                        crate::policy::tiers::tier_display_name(&t)
+                    )
+                })
+                .unwrap_or_default();
                 CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Denied: {reason} (active tier: {})",
+                    "Denied: {reason} (active tier: {}{suggestion})",
                     self.tier_name
                 ))])
             }
@@ -222,8 +244,73 @@ impl RedWrenchServer {
     }
 }
 
+const README: &str = include_str!("../../README.md");
+const ARCHITECTURE: &str = include_str!("../../ARCHITECTURE.md");
+
+const README_URI: &str = "redwrench://docs/readme";
+const ARCHITECTURE_URI: &str = "redwrench://docs/architecture";
+
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for RedWrenchServer {}
+impl ServerHandler for RedWrenchServer {
+    // NOTE (rmcp API adaptation): the task brief's plan assumed a version of
+    // `rmcp::model::ServerInfo` (an alias for `InitializeResult`) that could
+    // be built with `ServerInfo { capabilities: ..., ..Default::default() }`.
+    // The pinned rmcp 3.2.0 marks `InitializeResult` `#[non_exhaustive]`, so
+    // that struct-update syntax no longer compiles from outside the crate;
+    // its own `InitializeResult::new(capabilities)` constructor is the
+    // supported route to the same result.
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::ErrorData> {
+        Ok(rmcp::model::ListResourcesResult::with_all_items(vec![
+            rmcp::model::Resource::new(README_URI, "readme")
+                .with_description(
+                    "RedWrench's README: what it is, how to install and configure it, \
+                     and its tool catalogue.",
+                )
+                .with_mime_type("text/markdown"),
+            rmcp::model::Resource::new(ARCHITECTURE_URI, "architecture")
+                .with_description(
+                    "RedWrench's architecture document: the policy engine, executor, \
+                     and tier model.",
+                )
+                .with_mime_type("text/markdown"),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        let contents = match request.uri.as_str() {
+            README_URI => rmcp::model::ResourceContents::text(README, &request.uri)
+                .with_mime_type("text/markdown"),
+            ARCHITECTURE_URI => rmcp::model::ResourceContents::text(ARCHITECTURE, &request.uri)
+                .with_mime_type("text/markdown"),
+            other => {
+                return Err(rmcp::ErrorData::resource_not_found(
+                    format!("no such resource: {other}"),
+                    None,
+                ))
+            }
+        };
+        Ok(rmcp::model::ReadResourceResponse::Complete(
+            rmcp::model::ReadResourceResult::new(vec![contents]),
+        ))
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -239,10 +326,13 @@ pub(crate) mod tests {
                 command: String::new(),
                 arg_pattern: None,
                 effect: Effect::Allow,
+                description: "allow everything".to_string(),
             }])),
             timeout,
             "unrestricted".to_string(),
             Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Unrestricted,
+            vec![],
         )
     }
 
@@ -252,6 +342,8 @@ pub(crate) mod tests {
             timeout,
             "safe".to_string(),
             Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Safe,
+            vec![],
         )
     }
 
@@ -280,7 +372,7 @@ pub(crate) mod tests {
         (ctx, running)
     }
 
-    fn text_of(result: &CallToolResult) -> String {
+    pub(crate) fn text_of(result: &CallToolResult) -> String {
         result
             .content
             .iter()
@@ -288,6 +380,46 @@ pub(crate) mod tests {
             .map(|t| t.text.clone())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[tokio::test]
+    async fn readme_resource_matches_the_real_file_on_disk() {
+        let server = allow_all_server(Duration::from_secs(5));
+        let real = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"),
+        )
+        .unwrap();
+        let (ctx, _guard) = test_request_context(&server);
+        let response = server
+            .read_resource(
+                rmcp::model::ReadResourceRequestParams::new(super::README_URI),
+                ctx,
+            )
+            .await
+            .unwrap();
+        let result = match response {
+            rmcp::model::ReadResourceResponse::Complete(r) => r,
+            other => panic!("expected a complete response, got {other:?}"),
+        };
+        match &result.contents[0] {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                assert_eq!(text, &real)
+            }
+            other => panic!("expected text contents, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_resource_rejects_an_unknown_uri() {
+        let server = allow_all_server(Duration::from_secs(5));
+        let (ctx, _guard) = test_request_context(&server);
+        let response = server
+            .read_resource(
+                rmcp::model::ReadResourceRequestParams::new("redwrench://docs/nonexistent"),
+                ctx,
+            )
+            .await;
+        assert!(response.is_err());
     }
 
     #[tokio::test]
@@ -311,6 +443,70 @@ pub(crate) mod tests {
             text.contains("active tier: safe"),
             "unexpected text: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_denial_message_names_the_tier_that_would_allow_it() {
+        let server = RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(crate::policy::tiers::rules_for_tier(
+                &crate::policy::tiers::TierName::Safe,
+            ))),
+            Duration::from_secs(5),
+            "safe".to_string(),
+            Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Safe,
+            vec![],
+        );
+        let (ctx, _guard) = test_request_context(&server);
+        // dnf is not in safe_rules() at all, but standard_rules() adds it.
+        let result = server
+            .dispatch(
+                "dnf_install",
+                "dnf",
+                vec!["install".to_string(), "htop".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+        let text = text_of(&result);
+        assert!(
+            text.contains("would be allowed at: standard"),
+            "got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_denial_message_has_no_suggestion_when_no_tier_would_allow_it() {
+        let custom = vec![Rule {
+            command: "dnf".to_string(),
+            arg_pattern: None,
+            effect: Effect::Deny,
+            description: "custom: never allow dnf".to_string(),
+        }];
+        let mut rules = custom.clone();
+        rules.extend(crate::policy::tiers::rules_for_tier(
+            &crate::policy::tiers::TierName::Safe,
+        ));
+        let server = RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(rules)),
+            Duration::from_secs(5),
+            "safe".to_string(),
+            Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Safe,
+            custom,
+        );
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "dnf_install",
+                "dnf",
+                vec!["install".to_string(), "htop".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+        let text = text_of(&result);
+        assert!(!text.contains("would be allowed at"), "got: {text}");
     }
 
     #[tokio::test]

@@ -108,12 +108,14 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         );
     }
 
-    let tier_name = format!("{:?}", config.tier).to_lowercase();
+    let tier_name = policy::tiers::tier_display_name(&config.tier);
     let server = RedWrenchServer::new(
         Arc::new(policy::PolicyEngine::new(config.effective_rules())),
         Duration::from_secs(config.timeout_secs),
         tier_name,
         Duration::from_secs(config.max_stream_duration_secs),
+        config.tier.clone(),
+        config.custom_rules.clone(),
     );
 
     use rmcp::transport::streamable_http_server::{

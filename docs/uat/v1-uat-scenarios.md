@@ -206,3 +206,46 @@ argv vectors end-to-end. Run all three:
    **Expected:** allowed.
 5. Call `run_command` with `sar -o /tmp/evil.dat 1 5`.
    **Expected:** denied, the `-o` file-output flag is blocked.
+
+## Scenario 15: `list_capabilities` answers "what can you do right now"
+
+1. With `tier = "safe"`, connect an MCP client and call `list_capabilities`
+   with no arguments.
+2. **Expected:** the response names the active tier (`safe`), lists real
+   rules (not a placeholder), and reports what `standard` and
+   `unrestricted` would additionally unlock.
+3. From the same client, ask a plain-language question like "what can you
+   do right now?" and confirm the agent can answer it by calling this
+   tool, without needing to guess from a prior denial.
+
+## Scenario 16: `check_command` answers a targeted "would this be allowed" question
+
+1. With `tier = "safe"`, call `check_command` with
+   `{"command": "dnf", "args": ["list", "installed"]}`.
+2. **Expected:** `decision: "denied"`, a real reason, and
+   `would_be_allowed_at: "unrestricted"`. `standard`'s dnf rule only
+   matches `install`, `remove`, or `upgrade`, so `list installed` isn't
+   covered until `unrestricted` (the same class of hardware/package-listing
+   command issue #22 was originally about).
+3. Ask the connected agent "would `dnf list installed` be allowed?" and
+   confirm it answers from this tool rather than attempting the real
+   command to find out.
+
+## Scenario 17: a real denial names the tier that would allow it
+
+1. With `tier = "safe"`, call `run_command` with
+   `{"command": "dnf", "args": ["install", "htop"]}`.
+2. **Expected:** the denial message includes `would be allowed at:
+   standard`.
+3. Switch to `standard` tier, restart, repeat the same call.
+   **Expected:** it succeeds; no denial message to check.
+
+## Scenario 18: README and ARCHITECTURE are reachable as MCP resources
+
+1. Connect with an MCP client that supports the resources capability
+   (e.g. Claude Desktop).
+2. List available resources.
+   **Expected:** `readme` and `architecture` both appear.
+3. Read the `readme` resource.
+   **Expected:** the real README content, matching the repository's
+   `README.md` at the commit the running binary was built from.

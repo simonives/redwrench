@@ -9,19 +9,21 @@ pub enum TierName {
     Unrestricted,
 }
 
-fn allow(command: &str, arg_pattern: Option<&str>) -> Rule {
+fn allow(command: &str, arg_pattern: Option<&str>, description: &str) -> Rule {
     Rule {
         command: command.to_string(),
         arg_pattern: arg_pattern.map(|p| Regex::new(p).unwrap()),
         effect: Effect::Allow,
+        description: description.to_string(),
     }
 }
 
-fn deny(command: &str, arg_pattern: &str) -> Rule {
+fn deny(command: &str, arg_pattern: &str, description: &str) -> Rule {
     Rule {
         command: command.to_string(),
         arg_pattern: Some(Regex::new(arg_pattern).unwrap()),
         effect: Effect::Deny,
+        description: description.to_string(),
     }
 }
 
@@ -244,19 +246,40 @@ const JOURNALCTL_MUTATION_FLAGS: &str =
 /// legitimate flag.
 const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o";
 
-fn safe_rules() -> Vec<Rule> {
+pub(crate) fn safe_rules() -> Vec<Rule> {
     vec![
-        deny("systemctl", SYSTEMCTL_HOST_REDIRECT_FLAGS),
-        allow("systemctl", Some("^status")),
-        allow("systemctl", Some("^is-active")),
-        allow("systemctl", Some("^is-enabled")),
-        deny("journalctl", JOURNALCTL_MUTATION_FLAGS),
-        allow("journalctl", None),
-        deny("ping", PING_ABUSE_FLAGS),
-        allow("ping", None),
+        deny(
+            "systemctl",
+            SYSTEMCTL_HOST_REDIRECT_FLAGS,
+            "reject --host/--machine/--root/--image (redirects the operation off the local system)",
+        ),
+        allow("systemctl", Some("^status"), "read a unit's status"),
+        allow(
+            "systemctl",
+            Some("^is-active"),
+            "check whether a unit is active",
+        ),
+        allow(
+            "systemctl",
+            Some("^is-enabled"),
+            "check whether a unit is enabled at boot",
+        ),
+        deny(
+            "journalctl",
+            JOURNALCTL_MUTATION_FLAGS,
+            "reject mutation flags (--vacuum-*, --rotate, --flush, --sync, --relinquish-var, --setup-keys, --update-catalog)",
+        ),
+        allow("journalctl", None, "read the system journal"),
+        deny(
+            "ping",
+            PING_ABUSE_FLAGS,
+            "reject flood/zero-interval/adaptive/preload/oversized-packet flags",
+        ),
+        allow("ping", None, "send ICMP echo requests"),
         allow(
             "ip",
             Some(r"^(addr|route|link)(\s+(show|list|get)(\s.*)?)?$"),
+            "read network addresses, routes, or link state",
         ),
         // Read-only resource monitoring, safe to run indefinitely under
         // the `safe` tier: none of these mutate system state.
@@ -271,12 +294,20 @@ fn safe_rules() -> Vec<Rule> {
         // none of them write to a file, spawn a child process, or
         // otherwise touch state outside vmstat's own stdout, so an
         // unconditional `allow(None)` is safe.
-        allow("vmstat", None),
+        allow(
+            "vmstat",
+            None,
+            "read virtual memory, disk, and CPU statistics",
+        ),
         // `sar`'s `-o` (write raw sample data to an arbitrary path) is
         // denied before the broad allow, the same deny-before-allow
         // pattern used for ping/dnf/journalctl elsewhere in this file.
-        deny("sar", SAR_FILE_OUTPUT_FLAG),
-        allow("sar", None),
+        deny(
+            "sar",
+            SAR_FILE_OUTPUT_FLAG,
+            "reject -o (writes raw sample data to an arbitrary path)",
+        ),
+        allow("sar", None, "read system activity statistics"),
         // `top` requires `-b` (batch mode), interactive top would hang as
         // a non-interactive tool call rather than behave sensibly.
         //
@@ -288,17 +319,37 @@ fn safe_rules() -> Vec<Rule> {
         // to interactive mode. The pattern is left loose deliberately
         // rather than anchored to `^-b(\s|$)`, since the failure mode of
         // over-matching here is "top errors out," not a policy bypass.
-        allow("top", Some(r"^-b")),
+        allow(
+            "top",
+            Some(r"^-b"),
+            "read a one-shot batch-mode process snapshot",
+        ),
     ]
 }
 
-fn standard_rules() -> Vec<Rule> {
+pub(crate) fn standard_rules() -> Vec<Rule> {
     let mut rules = safe_rules();
     rules.extend(vec![
-        allow("systemctl", Some("^(start|stop|restart|enable|disable)")),
-        deny("dnf", DNF_TRUST_BYPASS_FLAGS),
-        allow("dnf", Some("^(install|remove|upgrade)")),
-        allow("rpm-ostree", Some("^(install|upgrade|status|uninstall)")),
+        allow(
+            "systemctl",
+            Some("^(start|stop|restart|enable|disable)"),
+            "start, stop, restart, enable, or disable a unit",
+        ),
+        deny(
+            "dnf",
+            DNF_TRUST_BYPASS_FLAGS,
+            "reject --nogpgcheck/--repofrompath/--setopt (bypasses package signature and repository trust)",
+        ),
+        allow(
+            "dnf",
+            Some("^(install|remove|upgrade)"),
+            "install, remove, or upgrade a package via dnf",
+        ),
+        allow(
+            "rpm-ostree",
+            Some("^(install|upgrade|status|uninstall)"),
+            "install, upgrade, check status, or uninstall a package via rpm-ostree",
+        ),
     ]);
     rules
 }
@@ -311,14 +362,33 @@ pub fn rules_for_tier(tier: &TierName) -> Vec<Rule> {
             command: String::new(),
             arg_pattern: None,
             effect: Effect::Allow,
+            description: "every command, no restrictions".to_string(),
         }],
     }
+}
+
+pub fn tier_display_name(tier: &TierName) -> String {
+    format!("{tier:?}").to_lowercase()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::policy::{Decision, PolicyEngine};
+
+    #[test]
+    fn no_tier_rule_has_an_empty_description() {
+        for tier in [TierName::Safe, TierName::Standard, TierName::Unrestricted] {
+            for rule in rules_for_tier(&tier) {
+                assert!(
+                    !rule.description.trim().is_empty(),
+                    "rule for command '{}' under {:?} has an empty description",
+                    rule.command,
+                    tier
+                );
+            }
+        }
+    }
 
     #[test]
     fn safe_tier_allows_systemctl_status_but_denies_stop() {

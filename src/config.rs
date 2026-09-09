@@ -46,7 +46,9 @@ struct RawConfig {
     /// calls. Optional; defaults to [`DEFAULT_MAX_STREAM_DURATION_SECS`].
     #[serde(default)]
     max_stream_duration_secs: Option<u64>,
-    /// Required when `tier` is `developer` (or higher). The OS username
+    /// Required when `tier` is exactly `developer`, and ignored under every
+    /// other tier including `unrestricted` (the privilege drop is not
+    /// inherited upward, see the design spec's non-goals). The OS username
     /// developer-tier tool execution runs as instead of root. Validated
     /// at server startup (see `src/main.rs`), not here: this struct only
     /// parses the config's shape, cross-cutting tier preconditions are

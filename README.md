@@ -152,11 +152,23 @@ it, so you narrow or widen any tier without editing the binary.
 Switch tiers with `redwrench config set-tier <tier>`.
 
 `developer` hands the agent a real shell and a compiler toolchain, but
-never as root: every developer-tier call drops privilege to the
-`developer_user` account before it runs, so whatever damage a bad or
+never as root: calls to the nine tools this tier adds (`bash`, `sh`,
+`python3`, `gcc`, `cc`, `node`, `npm`, `cargo`, `make`) drop privilege to
+the `developer_user` account before they run, so whatever damage a bad or
 adversarial command can do is bounded by that account's own file
-permissions, not by anything RedWrench filters. Pick an account with no
+permissions, not by anything RedWrench filters. Those commands also run
+with that account's `HOME` and working directory, so `~`, existing
+dotfiles, and per-user tooling caches (`~/.npm`, `~/.cargo`) all resolve
+the way they would in a normal login session. Pick an account with no
 more access than you're comfortable an agent using unsupervised.
+
+The privilege drop covers those nine tools only. Everything `developer`
+inherits from `standard` (service control via `systemctl`, package
+management via `dnf`/`rpm-ostree`, journal reads) continues to run as
+root under `developer` exactly as it does under `standard`, because those
+operations genuinely need root to work at all. `developer` is not an
+unprivileged tier; it is a tier whose added build-and-run tools are
+unprivileged.
 
 `unrestricted` is arbitrary remote code execution as whatever user
 RedWrench runs as. It is refused unless you pass

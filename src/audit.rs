@@ -19,17 +19,44 @@ use tracing_subscriber::prelude::*;
 ///
 /// Returns `Err` only if *neither* subscriber could be installed, which in
 /// practice means a subscriber was already set by someone else.
+///
+/// NOTE (post-review fix, full command output was leaking into the
+/// persistent journal): every deliberate log line RedWrench itself emits
+/// targets `"redwrench::audit"` (see [`record_invocation`], [`record_start`],
+/// and the auth-rejection warnings in `src/auth.rs`), and each one is a
+/// narrow, structured line by design, tool, command, tier, decision,
+/// nothing else. Without a filter, that restraint was cosmetic: `rmcp`'s own
+/// internal instrumentation (a `tracing::info!` per request/response inside
+/// its `serve_inner` span) was reaching the same subscriber unfiltered, and
+/// that instrumentation `Debug`-prints the full `CallToolResult`, meaning
+/// every command's complete stdout/stderr (a `systemctl status` dump
+/// including live SSH session details, in the case that surfaced this) was
+/// being written to the persistent systemd journal a second time, outside
+/// the one audit channel the design intends. Found live, via manual UAT
+/// against a real deployment, not in any test, since none of the existing
+/// tests read the journal's actual contents; they only assert the presence
+/// of `record_invocation`'s own fields. Restricting both layers to the
+/// `redwrench::audit` target at `INFO` and above closes this without
+/// touching a single call site, RedWrench's own logging was already
+/// correctly scoped, only the absence of a filter let something else's
+/// logging ride along.
 pub fn init_logging() -> anyhow::Result<()> {
+    let audit_only = audit_only_filter();
+
     match tracing_journald::layer() {
         Ok(journald_layer) => {
             tracing_subscriber::registry()
-                .with(journald_layer)
+                .with(journald_layer.with_filter(audit_only))
                 .try_init()?;
             Ok(())
         }
         Err(err) => {
             tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(audit_only),
+                )
                 .try_init()?;
             tracing::warn!(
                 target: "redwrench::audit",
@@ -125,9 +152,57 @@ pub fn start_reason(streaming: bool, indefinite: bool) -> &'static str {
     }
 }
 
+/// The filter `init_logging` applies to both the journald and stderr-fallback
+/// layers. Extracted to a plain function, rather than inlined twice, so it
+/// can also be exercised directly in tests without standing up a real
+/// subscriber (there is no journald socket in CI, and asserting against a
+/// live journal's contents would be a slow, environment-dependent test for
+/// what is really a pure "does this filter admit this target/level" check).
+fn audit_only_filter() -> tracing_subscriber::filter::Targets {
+    use tracing_subscriber::filter::LevelFilter;
+    tracing_subscriber::filter::Targets::new()
+        .with_target("redwrench::audit", LevelFilter::INFO)
+        .with_default(LevelFilter::OFF)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::Level;
+
+    #[test]
+    fn the_audit_filter_admits_only_the_redwrench_audit_target() {
+        let filter = audit_only_filter();
+        assert!(
+            filter.would_enable("redwrench::audit", &Level::INFO),
+            "the one deliberate audit channel must not be silenced"
+        );
+        assert!(
+            filter.would_enable("redwrench::audit", &Level::WARN),
+            "the auth-rejection warnings in src/auth.rs also target \
+             redwrench::audit at WARN, and must still get through"
+        );
+    }
+
+    #[test]
+    fn the_audit_filter_rejects_everything_else_including_at_info_level() {
+        // This is the regression the fix exists for: rmcp's own internal
+        // instrumentation targets its own module paths, at INFO, and
+        // Debug-prints the full request/response (including a command's
+        // complete stdout/stderr) on every call. A filter that only checked
+        // level, not target, would let this straight through, since it is
+        // logged at the same level RedWrench's own audit lines use.
+        let filter = audit_only_filter();
+        assert!(!filter.would_enable("rmcp::service", &Level::INFO));
+        assert!(!filter.would_enable(
+            "rmcp::transport::streamable_http_server::tower",
+            &Level::INFO
+        ));
+        // Not even at a level above what the audit target requires: this
+        // must be a target allowlist, not merely a level floor that happens
+        // to exclude DEBUG/TRACE noise.
+        assert!(!filter.would_enable("some_other_crate", &Level::ERROR));
+    }
 
     #[test]
     fn the_start_reason_names_which_trigger_fired() {

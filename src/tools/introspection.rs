@@ -69,7 +69,7 @@ impl RedWrenchServer {
             .collect();
 
         let response = CapabilitiesResponse {
-            active_tier: self.tier_name.clone(),
+            active_tier: tier_display_name(&self.tier),
             current_capabilities,
             unlocked_by_higher_tiers,
         };

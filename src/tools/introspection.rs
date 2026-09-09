@@ -163,6 +163,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_capabilities_reports_what_developer_tier_unlocks_over_standard() {
+        // (issue #28 rebase) `developer` sits between `standard` and
+        // `unrestricted` in tier_order(), and developer_rules() extends
+        // standard_rules() with an unconditional allow for every tool in
+        // DEVELOPER_TOOLS. A standard-tier query must report that block.
+        let server = server_at(TierName::Standard, "standard");
+        let result = server.list_capabilities().await;
+        let text = super::super::tests::text_of(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let unlocks = parsed["unlocked_by_higher_tiers"].as_array().unwrap();
+        let developer_unlock = unlocks
+            .iter()
+            .find(|entry| entry["tier"] == "developer")
+            .expect("standard should report what developer tier unlocks");
+        let additional: std::collections::HashSet<&str> = developer_unlock
+            ["additional_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| rule["command"].as_str().unwrap())
+            .collect();
+        for tool in crate::policy::tiers::DEVELOPER_TOOLS {
+            assert!(
+                additional.contains(tool),
+                "developer tier's unlock list should include {tool}, got: {additional:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn check_command_reports_allowed_with_no_reason_or_suggestion() {
         // (issue #26) A bare, unscoped journalctl call is no longer
         // allowed under `safe`, so this "genuinely allowed" fixture uses a

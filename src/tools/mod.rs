@@ -593,6 +593,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_denial_message_suggests_developer_tier_for_a_developer_tool() {
+        // (issue #28 rebase) python3 is not in safe_rules() or
+        // standard_rules() at all; developer_rules() is the first tier in
+        // tier_order() that adds it, so a standard-tier denial should name
+        // "developer", not skip straight to "unrestricted".
+        let server = RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(crate::policy::tiers::rules_for_tier(
+                &crate::policy::tiers::TierName::Standard,
+            ))),
+            Duration::from_secs(5),
+            "standard".to_string(),
+            Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Standard,
+            vec![],
+            None,
+        );
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "run_command",
+                "python3",
+                vec!["--version".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+        let text = text_of(&result);
+        assert!(
+            text.contains("would be allowed at: developer"),
+            "got: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_denial_message_has_no_suggestion_when_no_tier_would_allow_it() {
         let custom = vec![Rule {
             command: "dnf".to_string(),

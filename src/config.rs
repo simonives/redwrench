@@ -129,9 +129,7 @@ impl Config {
     /// since a non-matching custom rule simply falls through to the tier
     /// rules behind it.
     pub fn effective_rules(&self) -> Vec<Rule> {
-        let mut rules = self.custom_rules.clone();
-        rules.extend(crate::policy::tiers::rules_for_tier(&self.tier));
-        rules
+        crate::policy::introspection::effective_rules_for(&self.tier, &self.custom_rules)
     }
 }
 

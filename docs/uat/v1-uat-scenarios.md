@@ -249,3 +249,19 @@ argv vectors end-to-end. Run all three:
 3. Read the `readme` resource.
    **Expected:** the real README content, matching the repository's
    `README.md` at the commit the running binary was built from.
+## Scenario 19: developer tier can write, compile, and run a trivial program, under a dropped identity
+
+1. Set `tier = "developer"` and `developer_user = "<a real, non-root account on the test machine>"` in `config.toml`. Start `redwrench`.
+2. From an MCP client, call `run_command` with `{"command": "bash", "args": ["-c", "cat > ~/hello.c <<'EOF'\n#include <stdio.h>\nint main(void) { printf(\"hello world\\n\"); return 0; }\nEOF\ngcc ~/hello.c -o ~/hello && ~/hello"]}`. The paths are deliberately `~`-relative, not absolute: they only resolve if the dropped process actually has `developer_user`'s `HOME`, so an implementation that changed uid but left root's environment in place fails this step rather than silently passing it.
+3. **Expected:** the call succeeds, output includes `hello world`, and `~/hello.c` exists in `developer_user`'s home directory, owned by that account.
+4. Confirm the working directory too, call `run_command` with `{"command": "bash", "args": ["-c", "pwd; echo $HOME; echo $USER; id -un"]}`.
+   **Expected:** all four report `developer_user` and its home directory, not `root` and `/root`.
+5. On the target machine, while a longer-running variant of the same call is in flight (e.g. append `sleep 5` before the final run step), check `ps -o user= -p <pid>` for the `gcc`/`hello` process.
+   **Expected:** the process's user is `developer_user`, not `root`.
+6. Stop `redwrench`, set `developer_user = "root"`, and start it again.
+   **Expected:** it refuses to start, with an error saying the account resolves to uid 0 and would make the tier's privilege drop a no-op.
+
+## Scenario 20: developer tier cannot destroy the system, structurally
+
+1. With the same `developer` tier config as Scenario 19, call `run_command` with `{"command": "bash", "args": ["-c", "rm -rf /root"]}` (or another root-owned path the `developer_user` account has no write access to; do not actually target `/` itself even though the same principle applies, to avoid needing to rebuild the test machine if something about the test setup is wrong).
+2. **Expected:** the command runs (it is allowed by policy, `bash` is unconditionally allowed at this tier) but fails with a permissions error from `rm` itself (e.g. `rm: cannot remove '/root': Permission denied`), confirming the protection is the account's real Unix permissions, not a policy-level denial. Check the redwrench audit log for this call: it should show `decision="allowed"` (the policy engine permitted the call) with a nonzero exit code from `rm`, not `decision="denied"`, that distinction is what proves the guarantee is structural rather than pattern-matched.

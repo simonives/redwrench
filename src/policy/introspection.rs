@@ -21,9 +21,15 @@ pub fn describe_rules(rules: &[Rule]) -> Vec<RuleDescription> {
 
 /// Tiers in strictly increasing capability order. Hand-maintained, same as
 /// `rules_for_tier`'s match arm: both need updating together when a tier is
-/// added (e.g. `Developer`, once PR #28 merges).
+/// added. `Developer` sits between `Standard` and `Unrestricted` because
+/// `developer_rules()` extends `standard_rules()` (see `tiers.rs`).
 pub fn tier_order() -> &'static [TierName] {
-    &[TierName::Safe, TierName::Standard, TierName::Unrestricted]
+    &[
+        TierName::Safe,
+        TierName::Standard,
+        TierName::Developer,
+        TierName::Unrestricted,
+    ]
 }
 
 /// The full rule set a tier would evaluate against, including custom rules
@@ -80,7 +86,12 @@ mod tests {
     fn tier_order_matches_rules_for_tier_variants() {
         assert_eq!(
             tier_order(),
-            &[TierName::Safe, TierName::Standard, TierName::Unrestricted]
+            &[
+                TierName::Safe,
+                TierName::Standard,
+                TierName::Developer,
+                TierName::Unrestricted,
+            ]
         );
     }
 

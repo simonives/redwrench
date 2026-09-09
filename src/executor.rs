@@ -168,9 +168,37 @@ async fn drain_after_kill(
     (truncate_output(stdout_data), truncate_output(stderr_data))
 }
 
+/// The OS identity a developer-tier command runs under, instead of
+/// RedWrench's own (root) identity. Resolved once at startup from
+/// `config.developer_user` and carried unchanged from there to the
+/// `Command` builder.
+///
+/// It carries more than `(uid, gid)` deliberately. A process running under
+/// a different uid but still inheriting root's `HOME`, `USER`, `LOGNAME`
+/// and working directory is not a usable development environment: `~`
+/// expands to an unwritable `/root`, `npm` targets `/root/.npm`, `cargo`
+/// targets `/root/.cargo`, and relative paths resolve against whatever
+/// directory the service happened to start in. The design spec puts a
+/// natural development experience (existing dotfiles and tooling config
+/// reachable, package installation in scope) explicitly in scope, so the
+/// account's own name and home directory travel with its uid/gid rather
+/// than being discarded at resolution time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeveloperIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    /// The account's login name, used for the child's `USER` and `LOGNAME`.
+    pub name: String,
+    /// The account's home directory, used for the child's `HOME` and its
+    /// working directory.
+    pub home: std::path::PathBuf,
+}
+
 /// Runs `command` with `args` as an argv vector (never through a shell),
 /// bounded by `timeout`, optionally cancellable, optionally streaming each
-/// output chunk to `chunk_sink` as it arrives.
+/// output chunk to `chunk_sink` as it arrives, optionally spawned under a
+/// different identity than RedWrench's own (the `developer` tier's
+/// privilege-drop mechanism, see `policy::tiers::DEVELOPER_TOOLS`).
 ///
 /// Kills the spawned process on timeout via `kill_on_drop` plus an
 /// explicit `.kill()` call. This guarantees the directly-spawned
@@ -192,14 +220,81 @@ pub async fn execute(
     timeout: Duration,
     cancellation: Option<tokio_util::sync::CancellationToken>,
     chunk_sink: Option<ChunkSink>,
+    run_as: Option<DeveloperIdentity>,
 ) -> ExecutionResult {
-    let mut child = match Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .kill_on_drop(true)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    if let Some(DeveloperIdentity {
+        uid,
+        gid,
+        ref name,
+        ref home,
+    }) = run_as
     {
+        // Environment and working directory, so the dropped process gets
+        // the account's own context rather than root's. Without this the
+        // child runs under the developer_user's uid while `$HOME` still
+        // says `/root`, which breaks `~` expansion and sends every tool
+        // that caches under `$HOME` (npm, cargo) at a directory the child
+        // cannot write.
+        //
+        // std applies `current_dir` in the forked child *after* the
+        // uid/gid it was configured with but *before* any `pre_exec`
+        // closure, and the drop below happens entirely inside that closure,
+        // so the `chdir` still runs as root and cannot fail on a home
+        // directory the account itself could not traverse.
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USER", name)
+            .env("LOGNAME", name);
+
+        // The whole privilege drop happens here in one `pre_exec` closure
+        // rather than through `Command::uid`/`Command::gid`, because the
+        // supplementary group list has to be cleared *first* and the
+        // builder cannot express that ordering.
+        //
+        // `setgid`/`setuid` alone leave the child carrying every
+        // supplementary group RedWrench (root) belonged to, which is
+        // residual privilege the developer tier exists to remove. Clearing
+        // them needs CAP_SETGID, so it must happen while the child is still
+        // effectively root, i.e. before `setuid`. std runs `pre_exec`
+        // closures *after* it applies `.uid()`/`.gid()`, so pairing
+        // `.uid()`/`.gid()` with a `setgroups` closure fails at spawn with
+        // EPERM (verified empirically on Fedora, not assumed). Doing all
+        // three calls ourselves, in order, is the only way to get it right,
+        // and it also makes each step's failure loud rather than ignored.
+        // (`pre_exec` is an inherent method on `tokio::process::Command`
+        // here, so no `CommandExt` import is needed.)
+        //
+        // SAFETY: `pre_exec` runs in the forked child between `fork()` and
+        // `exec()`, where only async-signal-safe work is sound. The closure
+        // does nothing but issue three syscalls (`setgroups`, `setgid`,
+        // `setuid`) through nix's thin wrappers and, on failure, build an
+        // `io::Error` from a raw errno. It allocates nothing, takes no
+        // locks, touches no shared state, and captures only two `u32`s by
+        // copy, so it is safe to run in that context.
+        // The crate denies `unsafe_code` at the manifest level
+        // (`[lints.rust]` in Cargo.toml). This is its sole intentional
+        // exception: there is no safe API for the ordering this drop
+        // requires, and the SAFETY note above states why this particular
+        // closure is sound in a forked child. Any second `unsafe` block
+        // added to this crate should have to justify itself the same way.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                nix::unistd::setgroups(&[]).map_err(std::io::Error::from)?;
+                nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
+                    .map_err(std::io::Error::from)?;
+                nix::unistd::setuid(nix::unistd::Uid::from_raw(uid))
+                    .map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
+    }
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return ExecutionResult {
@@ -328,12 +423,183 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Resolves a real account from the test machine's passwd database into
+    /// a `DeveloperIdentity`, mirroring what `main.rs`'s `resolve_user` does
+    /// at startup. Resolved dynamically rather than hardcoding numbers or
+    /// paths, since those are conventions, not guarantees.
+    fn identity_for(username: &str) -> DeveloperIdentity {
+        let user = nix::unistd::User::from_name(username)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{username}' must exist on the Fedora test environment this project requires"
+                )
+            });
+        DeveloperIdentity {
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            name: user.name,
+            home: user.dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_as_drops_privilege_to_the_given_uid_and_gid() {
+        // "nobody" exists on every Fedora system (this project's own
+        // documented test environment, see CONTRIBUTING.md) and is never
+        // uid/gid 0, which is exactly what this test needs to distinguish
+        // "dropped" from "still root". Resolved dynamically rather than
+        // hardcoding a numeric uid, since that number is a convention, not a
+        // guarantee.
+        let identity = identity_for("nobody");
+        let (uid, gid) = (identity.uid, identity.gid);
+        assert_ne!(uid, 0, "test is meaningless if 'nobody' resolved to root");
+
+        let result = execute(
+            "id",
+            &["-u".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some(identity.clone()),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.stdout.trim(),
+            uid.to_string(),
+            "the spawned process's own reported uid must match the dropped identity, \
+             not RedWrench's (root's) uid"
+        );
+
+        // The gid is the other half of the permissions guarantee: an
+        // implementation that got the uid right and the gid wrong (or
+        // omitted it) would still pass the assertion above.
+        let result = execute(
+            "id",
+            &["-g".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some(identity.clone()),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.stdout.trim(),
+            gid.to_string(),
+            "the spawned process's own reported gid must match the dropped identity, \
+             not RedWrench's (root's) gid"
+        );
+
+        // `id -G` lists the effective gid plus every supplementary group.
+        // Asserting it is *exactly* the dropped gid and nothing else proves
+        // the supplementary group list was cleared, so the child carries no
+        // residual membership inherited from root.
+        let result = execute(
+            "id",
+            &["-G".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some(identity.clone()),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result
+                .stdout
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            vec![gid.to_string()],
+            "the spawned process must belong to exactly the dropped gid, with no \
+             supplementary groups inherited from RedWrench (root)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_as_gives_the_child_the_account_s_own_home_environment_and_cwd() {
+        // "daemon" is used rather than "nobody" because its home (`/sbin`)
+        // is a distinctive real path: "nobody"'s home is `/` on Fedora,
+        // which is also a plausible accidental default, so it could not
+        // tell a working implementation from a broken one.
+        let identity = identity_for("daemon");
+        assert_ne!(identity.uid, 0, "test is meaningless if 'daemon' is root");
+        let home = identity.home.display().to_string();
+        assert_ne!(
+            home, "/root",
+            "test is meaningless if the fixture account shares root's home"
+        );
+
+        let result = execute(
+            "sh",
+            &[
+                "-c".to_string(),
+                "echo \"$HOME\"; echo \"$USER\"; echo \"$LOGNAME\"; pwd".to_string(),
+            ],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some(identity.clone()),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                home.as_str(),
+                identity.name.as_str(),
+                identity.name.as_str()
+            ],
+            "the dropped child must see the account's own HOME/USER/LOGNAME, not \
+             inherit root's while running under a different uid: {:?}",
+            result.stdout
+        );
+
+        // `pwd` reports the physical path, and Fedora's usrmerge makes several
+        // conventional home directories symlinks (`/sbin` -> `/usr/bin`), so
+        // both sides are canonicalised before comparison rather than asserting
+        // the literal passwd string.
+        let expected_cwd = std::fs::canonicalize(&identity.home).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(lines[3]).unwrap(),
+            expected_cwd,
+            "the dropped child must start in the account's home directory, not \
+             whatever directory RedWrench itself was started in: {:?}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn no_run_as_means_no_behavioural_change_from_the_existing_path() {
+        // Regression guard: every existing caller passes `None` here, and
+        // must see exactly today's behaviour.
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "hello");
+    }
+
     #[tokio::test]
     async fn captures_stdout_and_exit_code_of_a_successful_command() {
         let result = execute(
             "echo",
             &["hello".to_string()],
             Duration::from_secs(5),
+            None,
             None,
             None,
         )
@@ -349,6 +615,7 @@ mod tests {
             "ls",
             &["/nonexistent-path-xyz".to_string()],
             Duration::from_secs(5),
+            None,
             None,
             None,
         )
@@ -368,6 +635,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(result.stdout.trim(), "hello; echo pwned");
@@ -379,6 +647,7 @@ mod tests {
             "sleep",
             &["5".to_string()],
             Duration::from_millis(100),
+            None,
             None,
             None,
         )
@@ -393,6 +662,7 @@ mod tests {
             "seq",
             &["1".to_string(), "1000000".to_string()],
             Duration::from_secs(10),
+            None,
             None,
             None,
         )
@@ -429,6 +699,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             None,
+            None,
         )
         .await;
 
@@ -460,6 +731,7 @@ mod tests {
             Duration::from_secs(30),
             None,
             None,
+            None,
         )
         .await;
         assert!(result.stdout.contains(&format!(
@@ -476,6 +748,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             Some(tx),
+            None,
         )
         .await;
         assert_eq!(result.exit_code, Some(0));
@@ -501,6 +774,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(result.exit_code, Some(0));
@@ -524,6 +798,7 @@ mod tests {
             &["30".to_string()],
             Duration::from_secs(60),
             Some(cancellation),
+            None,
             None,
         )
         .await;
@@ -557,6 +832,7 @@ mod tests {
             Duration::from_secs(60),
             Some(cancellation),
             None,
+            None,
         )
         .await;
 
@@ -583,6 +859,7 @@ mod tests {
             Duration::from_millis(150),
             None,
             None,
+            None,
         )
         .await;
 
@@ -605,6 +882,7 @@ mod tests {
             &["30".to_string()],
             Duration::from_millis(100),
             Some(cancellation),
+            None,
             None,
         )
         .await;
@@ -630,6 +908,7 @@ mod tests {
                 "sh",
                 &["-c".to_string(), "sleep 30 & exit 0".to_string()],
                 Duration::from_secs(20),
+                None,
                 None,
                 None,
             ),

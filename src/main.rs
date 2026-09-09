@@ -1,6 +1,7 @@
 mod cli;
 
 use clap::Parser;
+use redwrench::executor::DeveloperIdentity;
 use redwrench::{audit, auth, config, policy, tools};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
             let tier = match tier {
                 cli::TierName::Safe => policy::tiers::TierName::Safe,
                 cli::TierName::Standard => policy::tiers::TierName::Standard,
+                cli::TierName::Developer => policy::tiers::TierName::Developer,
                 cli::TierName::Unrestricted => policy::tiers::TierName::Unrestricted,
             };
             if matches!(tier, policy::tiers::TierName::Unrestricted) && !i_understand_the_risk {
@@ -56,6 +58,7 @@ fn update_tier_in_config(
     let tier_str = match tier {
         policy::tiers::TierName::Safe => "safe",
         policy::tiers::TierName::Standard => "standard",
+        policy::tiers::TierName::Developer => "developer",
         policy::tiers::TierName::Unrestricted => "unrestricted",
     };
     value
@@ -67,6 +70,75 @@ fn update_tier_in_config(
         );
     std::fs::write(path, toml::to_string_pretty(&value)?)?;
     Ok(())
+}
+
+/// Resolves a username to the identity developer-tier commands run
+/// under: numeric uid/gid, plus the account's own name and home
+/// directory (the child process's `HOME`/`USER`/`LOGNAME` and working
+/// directory, see `executor::DeveloperIdentity`). `Ok(None)` is never
+/// returned: `nix::unistd::User::from_name` returning `Ok(None)`
+/// (username not found) is turned into a proper error here, since every
+/// caller of this function needs a resolved identity or a reason it
+/// failed, not a third "maybe" state to handle separately.
+fn resolve_user(username: &str) -> anyhow::Result<DeveloperIdentity> {
+    let user = nix::unistd::User::from_name(username)
+        .map_err(|err| anyhow::anyhow!("failed to look up user '{username}': {err}"))?
+        .ok_or_else(|| anyhow::anyhow!("no such user '{username}' on this system"))?;
+    Ok(DeveloperIdentity {
+        uid: user.uid.as_raw(),
+        gid: user.gid.as_raw(),
+        name: user.name,
+        home: user.dir,
+    })
+}
+
+/// Checks the `developer` tier's precondition (a valid `developer_user`)
+/// and resolves it if the tier needs it. Returns the resolved identity
+/// so the caller doesn't have to resolve the same username twice.
+///
+/// Designed as a standalone function from the start, rather than inline
+/// logic in `run_server`, so it can be unit-tested directly: that
+/// function binds a real TCP listener and calls `axum::serve`, which
+/// never returns under normal operation, so it cannot itself be exercised
+/// by a `#[test]` the way this pure validation step can.
+fn validate_developer_tier_precondition(
+    tier: &policy::tiers::TierName,
+    developer_user: &Option<String>,
+) -> anyhow::Result<Option<DeveloperIdentity>> {
+    if !matches!(tier, policy::tiers::TierName::Developer) {
+        return Ok(None);
+    }
+    let username = developer_user.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config specifies the 'developer' policy tier, which requires \
+             'developer_user' to be set (the account developer-tier tool \
+             execution runs as instead of root). Refusing to start without it."
+        )
+    })?;
+    let identity = resolve_user(username).map_err(|err| {
+        anyhow::anyhow!(
+            "config specifies the 'developer' policy tier with \
+             developer_user = \"{username}\", but that account could not be \
+             resolved: {err}"
+        )
+    })?;
+    // A developer_user that resolves to uid 0 is the one value that makes
+    // this tier a silent no-op: every precondition passes, the tier reports
+    // itself as 'developer', and every developer-tier command still runs as
+    // root, which is the exact outcome the tier exists to prevent. Refuse it
+    // at startup, the same posture as every other precondition failure on
+    // this path, rather than warning and starting anyway.
+    if identity.uid == 0 {
+        anyhow::bail!(
+            "config specifies the 'developer' policy tier with \
+             developer_user = \"{username}\", but that account resolves to \
+             uid 0 (root). The entire safety mechanism of this tier is \
+             running developer-tier commands as a non-root account, so \
+             dropping privilege to root would make it a no-op. Refusing to \
+             start. Set 'developer_user' to a regular, unprivileged account."
+        );
+    }
+    Ok(Some(identity))
 }
 
 async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
@@ -108,6 +180,9 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         );
     }
 
+    let developer_identity =
+        validate_developer_tier_precondition(&config.tier, &config.developer_user)?;
+
     let tier_name = policy::tiers::tier_display_name(&config.tier);
     let server = RedWrenchServer::new(
         Arc::new(policy::PolicyEngine::new(config.effective_rules())),
@@ -116,6 +191,7 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         Duration::from_secs(config.max_stream_duration_secs),
         config.tier.clone(),
         config.custom_rules.clone(),
+        developer_identity,
     );
 
     use rmcp::transport::streamable_http_server::{
@@ -209,5 +285,103 @@ mod tests {
             !hosts.iter().any(|h| h.contains(':') && h.contains("8443")),
             "the bind host entry must not carry the port: {hosts:?}"
         );
+    }
+
+    #[test]
+    fn resolves_a_real_username_to_its_numeric_uid_gid_name_and_home() {
+        // "root" (uid 0, gid 0) exists on every Linux system, including CI,
+        // which is why it's used here purely to exercise the resolution
+        // mechanism itself. It is not a legal `developer_user` value,
+        // `validate_developer_tier_precondition` rejects uid 0 outright
+        // (dropping privilege *to* root would defeat the entire point of
+        // this tier), which is a separate test below. This one asserts only
+        // that resolution reports what the passwd database holds.
+        let identity = resolve_user("root").unwrap();
+        assert_eq!(identity.uid, 0);
+        assert_eq!(identity.gid, 0);
+        assert_eq!(identity.name, "root");
+        assert_eq!(identity.home, std::path::PathBuf::from("/root"));
+    }
+
+    #[test]
+    fn returns_a_clear_error_for_a_nonexistent_username() {
+        let result = resolve_user("this-user-should-not-exist-anywhere-12345");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("this-user-should-not-exist-anywhere-12345"));
+    }
+
+    #[test]
+    fn developer_tier_without_a_developer_user_is_rejected() {
+        let result =
+            validate_developer_tier_precondition(&policy::tiers::TierName::Developer, &None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("developer_user"));
+    }
+
+    #[test]
+    fn developer_tier_with_a_nonexistent_developer_user_is_rejected() {
+        let result = validate_developer_tier_precondition(
+            &policy::tiers::TierName::Developer,
+            &Some("this-user-should-not-exist-anywhere-12345".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn developer_tier_with_a_real_developer_user_succeeds() {
+        // "nobody" is the portable non-root fixture this project's Fedora
+        // test environment guarantees (see CONTRIBUTING.md), used here
+        // rather than "root" because a root developer_user is now rejected
+        // outright, see the test below.
+        let expected = nix::unistd::User::from_name("nobody")
+            .unwrap()
+            .expect("'nobody' must exist on the Fedora test environment this project requires");
+        let result = validate_developer_tier_precondition(
+            &policy::tiers::TierName::Developer,
+            &Some("nobody".to_string()),
+        );
+        assert_eq!(
+            result.unwrap(),
+            Some(DeveloperIdentity {
+                uid: expected.uid.as_raw(),
+                gid: expected.gid.as_raw(),
+                name: "nobody".to_string(),
+                home: expected.dir,
+            })
+        );
+    }
+
+    #[test]
+    fn developer_tier_with_root_as_the_developer_user_is_rejected() {
+        // The failure this guards is silent, not loud: "root" resolves
+        // perfectly well, so without an explicit uid 0 check the server
+        // starts, reports tier 'developer', and runs every developer-tier
+        // command as root anyway, with the safety mechanism a no-op and
+        // nothing anywhere saying so.
+        let result = validate_developer_tier_precondition(
+            &policy::tiers::TierName::Developer,
+            &Some("root".to_string()),
+        );
+        let err = result.expect_err("a developer_user resolving to uid 0 must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("uid 0") && message.contains("root"),
+            "the error must say plainly that the account resolves to root: {message}"
+        );
+    }
+
+    #[test]
+    fn non_developer_tiers_ignore_a_missing_developer_user() {
+        for tier in [
+            policy::tiers::TierName::Safe,
+            policy::tiers::TierName::Standard,
+            policy::tiers::TierName::Unrestricted,
+        ] {
+            let result = validate_developer_tier_precondition(&tier, &None);
+            assert_eq!(result.unwrap(), None);
+        }
     }
 }

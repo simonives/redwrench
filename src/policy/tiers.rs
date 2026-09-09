@@ -251,7 +251,20 @@ fn safe_rules() -> Vec<Rule> {
         allow("systemctl", Some("^is-active")),
         allow("systemctl", Some("^is-enabled")),
         deny("journalctl", JOURNALCTL_MUTATION_FLAGS),
-        allow("journalctl", None),
+        // (issue #26) `safe` requires a unit scope for journalctl reads.
+        // The old `allow("journalctl", None)` matched any argument list
+        // once the mutation-flags deny above didn't fire, which let a
+        // `safe`-tier caller, the lowest, always-on tier, read the entire
+        // system journal unscoped. Confirmed live during UAT: a single
+        // unscoped call at `safe` returned the full `sudo` audit trail,
+        // Tailscale's real endpoints, and other data well outside `safe`'s
+        // own "read-only diagnostics" definition. Anchoring the allow to
+        // `-u`/`--unit` means a bare, unscoped call no longer matches this
+        // rule and falls through to deny-by-default, the same outcome
+        // every other unlisted command already gets. The unscoped form is
+        // restored at `standard` tier (see standard_rules() below), not
+        // removed outright.
+        allow("journalctl", Some(r"(?:^|\s)(?:-u\b|--unit\b)")),
         deny("ping", PING_ABUSE_FLAGS),
         allow("ping", None),
         allow(
@@ -299,6 +312,16 @@ fn standard_rules() -> Vec<Rule> {
         deny("dnf", DNF_TRUST_BYPASS_FLAGS),
         allow("dnf", Some("^(install|remove|upgrade)")),
         allow("rpm-ostree", Some("^(install|upgrade|status|uninstall)")),
+        // (issue #26) `standard` already grants broader operational
+        // capability than `safe` (service control, package installation),
+        // so the whole-system-journal read that `safe` no longer allows
+        // unscoped is restored here instead of at the lowest, always-on
+        // tier. This new allow only matters once the shared
+        // `JOURNALCTL_MUTATION_FLAGS` deny and the unit-scoped `safe`
+        // allow (both inherited from `safe_rules()` above) have already
+        // been checked, since `standard_rules()` extends `safe_rules()`
+        // and evaluation is first-match-wins.
+        allow("journalctl", None),
     ]);
     rules
 }
@@ -410,6 +433,77 @@ mod tests {
             engine.evaluate("journalctl", &["-u".into(), "sshd".into()]),
             Decision::Allowed
         ));
+    }
+
+    #[test]
+    fn safe_tier_requires_a_unit_scope_for_journalctl_but_standard_tier_restores_unscoped_reads() {
+        // (issue #26) A bare, unscoped call, the exact shape
+        // `journalctl_args` builds when `unit` is `None` (see
+        // src/tools/journalctl.rs), must no longer be readable at `safe`
+        // tier: this is the whole-system-journal exposure the fix closes.
+        let safe = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            safe.evaluate(
+                "journalctl",
+                &["-n".into(), "50".into(), "--no-pager".into()]
+            ),
+            Decision::Denied(_)
+        ));
+
+        // The same unscoped call is restored at `standard` tier, which
+        // already grants broader operational capability than `safe`.
+        let standard = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        assert!(matches!(
+            standard.evaluate(
+                "journalctl",
+                &["-n".into(), "50".into(), "--no-pager".into()]
+            ),
+            Decision::Allowed
+        ));
+
+        // A unit-scoped call is a regression check: it must remain allowed
+        // under both tiers, unaffected by this fix.
+        for tier in [TierName::Safe, TierName::Standard] {
+            let engine = PolicyEngine::new(rules_for_tier(&tier));
+            assert!(
+                matches!(
+                    engine.evaluate("journalctl", &["-u".into(), "sshd.service".into()]),
+                    Decision::Allowed
+                ),
+                "journalctl -u sshd.service should be allowed under the {tier:?} tier"
+            );
+        }
+
+        // The `JOURNALCTL_MUTATION_FLAGS` deny still fires before either
+        // allow rule gets a chance, for both a unit-scoped and an unscoped
+        // attempt, under both tiers. `standard_rules()` extends
+        // `safe_rules()`, so the shared deny (which precedes both the
+        // unit-scoped `safe` allow and the unscoped `standard` allow) must
+        // still win under first-match-wins evaluation.
+        for tier in [TierName::Safe, TierName::Standard] {
+            let engine = PolicyEngine::new(rules_for_tier(&tier));
+            assert!(
+                matches!(
+                    engine.evaluate(
+                        "journalctl",
+                        &[
+                            "-u".into(),
+                            "sshd.service".into(),
+                            "--vacuum-time=1s".into()
+                        ]
+                    ),
+                    Decision::Denied(_)
+                ),
+                "unit-scoped journalctl --vacuum-time=1s should be denied under the {tier:?} tier"
+            );
+            assert!(
+                matches!(
+                    engine.evaluate("journalctl", &["--vacuum-time=1s".into()]),
+                    Decision::Denied(_)
+                ),
+                "unscoped journalctl --vacuum-time=1s should be denied under the {tier:?} tier"
+            );
+        }
     }
 
     // The tests below exercise the `run_command`-shaped path: a bare
@@ -816,9 +910,62 @@ mod tests {
         }
 
         // Ordinary reads, including flags that share leading letters with
-        // the denied ones, stay allowed.
+        // the denied ones, stay allowed once scoped to a unit. (issue #26:
+        // `safe` now requires a unit scope for journalctl reads, so these
+        // carry `-u sshd` where the pre-fix version of this test did not.)
         for allowed in [
             vec!["-u".to_string(), "sshd".to_string()],
+            vec![
+                "-u".to_string(),
+                "sshd".to_string(),
+                "--since".to_string(),
+                "today".to_string(),
+            ],
+            vec![
+                "-u".to_string(),
+                "sshd".to_string(),
+                "--follow".to_string(),
+                "--no-pager".to_string(),
+            ],
+            vec![
+                "-u".to_string(),
+                "sshd".to_string(),
+                "--reverse".to_string(),
+                "--full".to_string(),
+            ],
+            vec![
+                "-u".to_string(),
+                "sshd".to_string(),
+                "--system".to_string(),
+                "--utc".to_string(),
+            ],
+            vec![
+                "-u".to_string(),
+                "sshd".to_string(),
+                "--root=/mnt/other".to_string(),
+            ],
+            vec![
+                "-u".to_string(),
+                "sshd".to_string(),
+                "--file".to_string(),
+                "/var/log/journal/x".to_string(),
+            ],
+        ] {
+            assert!(
+                matches!(engine.evaluate("journalctl", &allowed), Decision::Allowed),
+                "journalctl {allowed:?} should be allowed under the safe tier"
+            );
+        }
+
+        // (issue #26) These same reads, without a unit scope, used to be
+        // `Decision::Allowed` under this test before the fix, under the old
+        // `allow("journalctl", None)` rule. They still don't trip
+        // `JOURNALCTL_MUTATION_FLAGS` (that was, and remains, this test's
+        // point), but a bare unscoped call no longer matches any allow rule
+        // at `safe` tier, so it now falls through to deny-by-default. This
+        // is the intended consequence of the fix, not a mistake or a
+        // regression: a bare unscoped read is exactly the case being closed.
+        for now_denied in [
             vec!["--since".to_string(), "today".to_string()],
             vec!["--follow".to_string(), "--no-pager".to_string()],
             vec!["--reverse".to_string(), "--full".to_string()],
@@ -827,8 +974,12 @@ mod tests {
             vec!["--file".to_string(), "/var/log/journal/x".to_string()],
         ] {
             assert!(
-                matches!(engine.evaluate("journalctl", &allowed), Decision::Allowed),
-                "journalctl {allowed:?} should be allowed under the safe tier"
+                matches!(
+                    engine.evaluate("journalctl", &now_denied),
+                    Decision::Denied(_)
+                ),
+                "journalctl {now_denied:?} should be denied under the safe tier \
+                 without a unit scope (issue #26)"
             );
         }
     }
@@ -877,7 +1028,36 @@ mod tests {
         // bare substring pattern (verified by hand before writing this
         // test).
         let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+
+        // (issue #26) `safe` now requires a unit scope for journalctl
+        // reads, so the substring-safety property this test exists to
+        // cover is re-homed here as a unit-scoped call: a legitimate unit
+        // name that happens to contain a deny-pattern substring (e.g.
+        // `y--setup-keys`) must still be readable at `safe` tier.
         for allowed in [
+            vec!["-u".to_string(), "myunit--rotate".to_string()],
+            vec!["-u".to_string(), "unit--flush".to_string()],
+            vec!["-u".to_string(), "svc--syncme".to_string()],
+            vec!["-u".to_string(), "abc--relinquish".to_string()],
+            vec!["-u".to_string(), "x--smtest".to_string()],
+            vec!["-u".to_string(), "y--setup-keys".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("journalctl", &allowed), Decision::Allowed),
+                "journalctl {allowed:?} should be allowed under the safe tier \
+                 (substring, not a token-start flag)"
+            );
+        }
+
+        // (issue #26) The same values as bare positional arguments, with no
+        // unit scope, used to be `Decision::Allowed` under this test before
+        // the fix, under the old `allow("journalctl", None)` rule. They
+        // still don't trip `JOURNALCTL_MUTATION_FLAGS` (the substring-safety
+        // property proven above still holds), but without a unit scope they
+        // no longer match any allow rule at `safe` tier, so they now fall
+        // through to deny-by-default. Intended consequence of the fix, not
+        // a regression.
+        for now_denied in [
             vec!["myunit--rotate".to_string()],
             vec!["unit--flush".to_string()],
             vec!["svc--syncme".to_string()],
@@ -886,9 +1066,12 @@ mod tests {
             vec!["y--setup-keys".to_string()],
         ] {
             assert!(
-                matches!(engine.evaluate("journalctl", &allowed), Decision::Allowed),
-                "journalctl {allowed:?} should be allowed under the safe tier \
-                 (substring, not a token-start flag)"
+                matches!(
+                    engine.evaluate("journalctl", &now_denied),
+                    Decision::Denied(_)
+                ),
+                "journalctl {now_denied:?} should be denied under the safe tier \
+                 without a unit scope (issue #26)"
             );
         }
 

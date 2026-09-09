@@ -6,6 +6,7 @@ use rmcp::{tool_handler, ServerHandler};
 use std::time::Duration;
 
 pub mod dnf;
+pub mod introspection;
 pub mod journalctl;
 pub mod network;
 pub mod run_command;
@@ -53,7 +54,8 @@ impl RedWrenchServer {
                 + Self::systemctl_router()
                 + Self::dnf_router()
                 + Self::journalctl_router()
-                + Self::network_router(),
+                + Self::network_router()
+                + Self::introspection_router(),
         }
     }
 
@@ -292,7 +294,7 @@ pub(crate) mod tests {
         (ctx, running)
     }
 
-    fn text_of(result: &CallToolResult) -> String {
+    pub(crate) fn text_of(result: &CallToolResult) -> String {
         result
             .content
             .iter()

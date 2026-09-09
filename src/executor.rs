@@ -170,7 +170,9 @@ async fn drain_after_kill(
 
 /// Runs `command` with `args` as an argv vector (never through a shell),
 /// bounded by `timeout`, optionally cancellable, optionally streaming each
-/// output chunk to `chunk_sink` as it arrives.
+/// output chunk to `chunk_sink` as it arrives, optionally spawned under a
+/// different `(uid, gid)` than RedWrench's own (the `developer` tier's
+/// privilege-drop mechanism, see `policy::tiers::DEVELOPER_TOOLS`).
 ///
 /// Kills the spawned process on timeout via `kill_on_drop` plus an
 /// explicit `.kill()` call. This guarantees the directly-spawned
@@ -192,14 +194,17 @@ pub async fn execute(
     timeout: Duration,
     cancellation: Option<tokio_util::sync::CancellationToken>,
     chunk_sink: Option<ChunkSink>,
+    run_as: Option<(u32, u32)>,
 ) -> ExecutionResult {
-    let mut child = match Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .kill_on_drop(true)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some((uid, gid)) = run_as {
+        cmd.uid(uid).gid(gid);
+    }
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return ExecutionResult {
@@ -329,11 +334,62 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn run_as_drops_privilege_to_the_given_uid_and_gid() {
+        // "nobody" exists on every Fedora system (this project's own
+        // documented test environment, see CONTRIBUTING.md) and is never
+        // uid/gid 0, which is exactly what this test needs to distinguish
+        // "dropped" from "still root". Resolved dynamically rather than
+        // hardcoding a numeric uid, since that number is a convention, not a
+        // guarantee.
+        let user = nix::unistd::User::from_name("nobody")
+            .unwrap()
+            .expect("'nobody' must exist on the Fedora test environment this project requires");
+        let (uid, gid) = (user.uid.as_raw(), user.gid.as_raw());
+        assert_ne!(uid, 0, "test is meaningless if 'nobody' resolved to root");
+
+        let result = execute(
+            "id",
+            &["-u".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some((uid, gid)),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.stdout.trim(),
+            uid.to_string(),
+            "the spawned process's own reported uid must match the dropped identity, \
+             not RedWrench's (root's) uid"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_run_as_means_no_behavioural_change_from_the_existing_path() {
+        // Regression guard: every existing caller passes `None` here, and
+        // must see exactly today's behaviour.
+        let result = execute(
+            "echo",
+            &["hello".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "hello");
+    }
+
+    #[tokio::test]
     async fn captures_stdout_and_exit_code_of_a_successful_command() {
         let result = execute(
             "echo",
             &["hello".to_string()],
             Duration::from_secs(5),
+            None,
             None,
             None,
         )
@@ -349,6 +405,7 @@ mod tests {
             "ls",
             &["/nonexistent-path-xyz".to_string()],
             Duration::from_secs(5),
+            None,
             None,
             None,
         )
@@ -368,6 +425,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(result.stdout.trim(), "hello; echo pwned");
@@ -379,6 +437,7 @@ mod tests {
             "sleep",
             &["5".to_string()],
             Duration::from_millis(100),
+            None,
             None,
             None,
         )
@@ -393,6 +452,7 @@ mod tests {
             "seq",
             &["1".to_string(), "1000000".to_string()],
             Duration::from_secs(10),
+            None,
             None,
             None,
         )
@@ -429,6 +489,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             None,
+            None,
         )
         .await;
 
@@ -460,6 +521,7 @@ mod tests {
             Duration::from_secs(30),
             None,
             None,
+            None,
         )
         .await;
         assert!(result.stdout.contains(&format!(
@@ -476,6 +538,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             Some(tx),
+            None,
         )
         .await;
         assert_eq!(result.exit_code, Some(0));
@@ -501,6 +564,7 @@ mod tests {
             Duration::from_secs(5),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(result.exit_code, Some(0));
@@ -524,6 +588,7 @@ mod tests {
             &["30".to_string()],
             Duration::from_secs(60),
             Some(cancellation),
+            None,
             None,
         )
         .await;
@@ -557,6 +622,7 @@ mod tests {
             Duration::from_secs(60),
             Some(cancellation),
             None,
+            None,
         )
         .await;
 
@@ -583,6 +649,7 @@ mod tests {
             Duration::from_millis(150),
             None,
             None,
+            None,
         )
         .await;
 
@@ -605,6 +672,7 @@ mod tests {
             &["30".to_string()],
             Duration::from_millis(100),
             Some(cancellation),
+            None,
             None,
         )
         .await;
@@ -630,6 +698,7 @@ mod tests {
                 "sh",
                 &["-c".to_string(), "sleep 30 & exit 0".to_string()],
                 Duration::from_secs(20),
+                None,
                 None,
                 None,
             ),

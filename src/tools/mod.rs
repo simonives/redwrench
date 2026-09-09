@@ -188,6 +188,7 @@ impl RedWrenchServer {
                     effective_timeout,
                     Some(ctx.ct.clone()),
                     chunk_sink,
+                    None,
                 )
                 .await;
 

@@ -71,6 +71,51 @@ fn update_tier_in_config(
     Ok(())
 }
 
+/// Resolves a username to its numeric `(uid, gid)`, for the `developer`
+/// tier's privilege-drop mechanism. `Ok(None)` is never returned:
+/// `nix::unistd::User::from_name` returning `Ok(None)` (username not
+/// found) is turned into a proper error here, since every caller of this
+/// function needs a resolved identity or a reason it failed, not a third
+/// "maybe" state to handle separately.
+fn resolve_user(username: &str) -> anyhow::Result<(u32, u32)> {
+    let user = nix::unistd::User::from_name(username)
+        .map_err(|err| anyhow::anyhow!("failed to look up user '{username}': {err}"))?
+        .ok_or_else(|| anyhow::anyhow!("no such user '{username}' on this system"))?;
+    Ok((user.uid.as_raw(), user.gid.as_raw()))
+}
+
+/// Checks the `developer` tier's precondition (a valid `developer_user`)
+/// and resolves it if the tier needs it. Returns the resolved identity
+/// so the caller doesn't have to resolve the same username twice.
+///
+/// Designed as a standalone function from the start, rather than inline
+/// logic in `run_server`, so it can be unit-tested directly: that
+/// function binds a real TCP listener and calls `axum::serve`, which
+/// never returns under normal operation, so it cannot itself be exercised
+/// by a `#[test]` the way this pure validation step can.
+fn validate_developer_tier_precondition(
+    tier: &policy::tiers::TierName,
+    developer_user: &Option<String>,
+) -> anyhow::Result<Option<(u32, u32)>> {
+    if !matches!(tier, policy::tiers::TierName::Developer) {
+        return Ok(None);
+    }
+    let username = developer_user.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config specifies the 'developer' policy tier, which requires \
+             'developer_user' to be set (the account developer-tier tool \
+             execution runs as instead of root). Refusing to start without it."
+        )
+    })?;
+    Ok(Some(resolve_user(username).map_err(|err| {
+        anyhow::anyhow!(
+            "config specifies the 'developer' policy tier with \
+             developer_user = \"{username}\", but that account could not be \
+             resolved: {err}"
+        )
+    })?))
+}
+
 async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     // NOTE (post-review fix, audit must not fail silently): if journald is
     // unavailable (containers, non-systemd hosts), `audit::init_logging`
@@ -209,5 +254,64 @@ mod tests {
             !hosts.iter().any(|h| h.contains(':') && h.contains("8443")),
             "the bind host entry must not carry the port: {hosts:?}"
         );
+    }
+
+    #[test]
+    fn resolves_a_real_username_to_its_numeric_uid_and_gid() {
+        // "root" (uid 0, gid 0) exists on every Linux system, including
+        // CI, which is why it's used here purely to exercise the
+        // resolution mechanism. It is not an example of a sane real
+        // `developer_user` value, dropping privilege *to* root would
+        // defeat the entire point of this tier.
+        let (uid, gid) = resolve_user("root").unwrap();
+        assert_eq!(uid, 0);
+        assert_eq!(gid, 0);
+    }
+
+    #[test]
+    fn returns_a_clear_error_for_a_nonexistent_username() {
+        let result = resolve_user("this-user-should-not-exist-anywhere-12345");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("this-user-should-not-exist-anywhere-12345"));
+    }
+
+    #[test]
+    fn developer_tier_without_a_developer_user_is_rejected() {
+        let result = validate_developer_tier_precondition(&policy::tiers::TierName::Developer, &None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("developer_user"));
+    }
+
+    #[test]
+    fn developer_tier_with_a_nonexistent_developer_user_is_rejected() {
+        let result = validate_developer_tier_precondition(
+            &policy::tiers::TierName::Developer,
+            &Some("this-user-should-not-exist-anywhere-12345".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn developer_tier_with_a_real_developer_user_succeeds() {
+        let result = validate_developer_tier_precondition(
+            &policy::tiers::TierName::Developer,
+            &Some("root".to_string()),
+        );
+        assert_eq!(result.unwrap(), Some((0, 0)));
+    }
+
+    #[test]
+    fn non_developer_tiers_ignore_a_missing_developer_user() {
+        for tier in [
+            policy::tiers::TierName::Safe,
+            policy::tiers::TierName::Standard,
+            policy::tiers::TierName::Unrestricted,
+        ] {
+            let result = validate_developer_tier_precondition(&tier, &None);
+            assert_eq!(result.unwrap(), None);
+        }
     }
 }

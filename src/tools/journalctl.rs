@@ -100,9 +100,11 @@ fn journalctl_args(unit: Option<String>, lines: u32, follow: bool) -> Result<Vec
 impl RedWrenchServer {
     #[tool(
         description = "Return the most recent lines from the systemd journal, \
-        optionally filtered to a single unit. Set follow: true to keep \
-        streaming new lines after the initial output, until cancelled or \
-        the server's safety-net duration elapses. Allowed under every tier."
+        optionally filtered to a single unit. Filtering by unit is allowed \
+        under every tier; omitting unit to read the whole, unscoped system \
+        journal requires `standard` tier or higher. Set follow: true to \
+        keep streaming new lines after the initial output, until cancelled \
+        or the server's safety-net duration elapses."
     )]
     pub async fn journalctl_tail(
         &self,

@@ -93,6 +93,20 @@ impl RedWrenchServer {
     // no real stdout/exit code to hand back, so it belongs on the same
     // `is_error: true` side as a denial, not lumped in with an actually
     // completed command's real output.
+    // (issue #27) Extracted from `dispatch()`'s body so the gating decision
+    // is directly unit-testable without spinning up a real command
+    // execution: this is pure Option/slice logic, no I/O. An allowlist of
+    // what STAYS root, not an allowlist of what gets dropped, see
+    // `ROOT_REQUIRED_TOOLS`'s own doc comment for why the inversion matters.
+    fn developer_tier_run_as(
+        developer_identity: &Option<crate::executor::DeveloperIdentity>,
+        command: &str,
+    ) -> Option<crate::executor::DeveloperIdentity> {
+        developer_identity
+            .clone()
+            .filter(|_| !crate::policy::tiers::ROOT_REQUIRED_TOOLS.contains(&command))
+    }
+
     pub async fn dispatch(
         &self,
         tool: &str,
@@ -204,16 +218,14 @@ impl RedWrenchServer {
                     tx
                 });
 
-                // The privilege drop applies only to a developer-tier tool call, and
-                // only when this server actually has a resolved developer_identity
-                // (i.e. the active tier is exactly `developer`, see the field's own
-                // doc comment on RedWrenchServer, it is never Some under any other
-                // tier including unrestricted, so this check alone is sufficient,
-                // no separate tier-name comparison needed here).
-                let run_as = self
-                    .developer_identity
-                    .clone()
-                    .filter(|_| crate::policy::tiers::DEVELOPER_TOOLS.contains(&command));
+                // (issue #27) The privilege drop applies whenever this server has
+                // a resolved developer_identity (i.e. the active tier is exactly
+                // `developer`, see the field's own doc comment on RedWrenchServer,
+                // it is never Some under any other tier including unrestricted)
+                // UNLESS the command is one that genuinely needs root. See
+                // developer_tier_run_as's own doc comment for why this is an
+                // allowlist of what stays root, not of what gets dropped.
+                let run_as = Self::developer_tier_run_as(&self.developer_identity, command);
 
                 let result = crate::executor::execute(
                     command,
@@ -534,6 +546,102 @@ pub(crate) mod tests {
         assert!(
             !text_of(&result).starts_with("Denied:"),
             "systemctl status must still be allowed under developer tier, got: {}",
+            text_of(&result)
+        );
+    }
+
+    #[test]
+    fn developer_tier_run_as_keeps_every_root_required_tool_as_root() {
+        // (issue #27 regression) systemctl/dnf/journalctl/etc. must still
+        // run as root under developer tier, inherited unchanged from
+        // standard/safe. This is the "regression tests confirming
+        // systemctl/dnf/etc. still correctly run as root" the issue asks
+        // for, checked directly against the gating logic rather than by
+        // trying to observe a real process's uid.
+        let identity = developer_identity_for("nobody");
+        for tool in crate::policy::tiers::ROOT_REQUIRED_TOOLS {
+            assert_eq!(
+                RedWrenchServer::developer_tier_run_as(&Some(identity.clone()), tool),
+                None,
+                "{tool} should stay root under developer tier"
+            );
+        }
+    }
+
+    #[test]
+    fn developer_tier_run_as_drops_every_fixed_developer_tool() {
+        // Regression: the inversion must not change behaviour for the
+        // fixed DEVELOPER_TOOLS list, none of which appear in
+        // ROOT_REQUIRED_TOOLS, so all of them should still be dropped.
+        let identity = developer_identity_for("nobody");
+        for tool in crate::policy::tiers::DEVELOPER_TOOLS {
+            assert_eq!(
+                RedWrenchServer::developer_tier_run_as(&Some(identity.clone()), tool),
+                Some(identity.clone()),
+                "{tool} should still be dropped under developer tier"
+            );
+        }
+    }
+
+    #[test]
+    fn developer_tier_run_as_drops_an_unanticipated_custom_rules_command() {
+        // (issue #27) The gap this issue closes: a command outside both
+        // DEVELOPER_TOOLS and ROOT_REQUIRED_TOOLS (reachable only via an
+        // operator's custom_rules allow entry, since no tier's own rules
+        // grant it) must default to dropped privilege, not root.
+        let identity = developer_identity_for("nobody");
+        assert_eq!(
+            RedWrenchServer::developer_tier_run_as(&Some(identity.clone()), "perl"),
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn developer_tier_run_as_is_none_when_there_is_no_developer_identity() {
+        // Every other tier (safe/standard/unrestricted) never has a
+        // developer_identity at all, so the filter must short-circuit to
+        // None regardless of the command, this is what keeps the privilege
+        // drop scoped to developer tier alone.
+        assert_eq!(RedWrenchServer::developer_tier_run_as(&None, "bash"), None);
+        assert_eq!(RedWrenchServer::developer_tier_run_as(&None, "id"), None);
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_privilege_for_a_custom_rules_allowed_tool_under_developer_tier() {
+        // (issue #27) End-to-end version of the gap: `id` is not in
+        // DEVELOPER_TOOLS, so it is only reachable under `developer` tier
+        // via a custom_rules allow, exactly the operator action the issue
+        // describes. It must still get the real privilege drop applied,
+        // not just pass the unit-level gating check above.
+        let identity = developer_identity_for("nobody");
+        let uid = identity.uid;
+        let custom = vec![Rule {
+            command: "id".to_string(),
+            arg_pattern: None,
+            effect: Effect::Allow,
+            description: "test: custom allow for id under developer tier".to_string(),
+        }];
+        let mut rules = custom.clone();
+        rules.extend(crate::policy::tiers::rules_for_tier(
+            &crate::policy::tiers::TierName::Developer,
+        ));
+        let server = RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(rules)),
+            Duration::from_secs(5),
+            "developer".to_string(),
+            Duration::from_secs(1800),
+            crate::policy::tiers::TierName::Developer,
+            custom,
+            Some(identity),
+        );
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch("run_command", "id", vec!["-u".to_string()], ctx, None)
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        assert!(
+            text_of(&result).contains(&format!("stdout:\n{uid}")),
+            "expected the dropped uid ({uid}) in the command output, got: {}",
             text_of(&result)
         );
     }

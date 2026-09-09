@@ -182,13 +182,23 @@ impl RedWrenchServer {
                     tx
                 });
 
+                // The privilege drop applies only to a developer-tier tool call, and
+                // only when this server actually has a resolved developer_identity
+                // (i.e. the active tier is exactly `developer`, see the field's own
+                // doc comment on RedWrenchServer, it is never Some under any other
+                // tier including unrestricted, so this check alone is sufficient,
+                // no separate tier-name comparison needed here).
+                let run_as = self
+                    .developer_identity
+                    .filter(|_| crate::policy::tiers::DEVELOPER_TOOLS.contains(&command));
+
                 let result = crate::executor::execute(
                     command,
                     &args,
                     effective_timeout,
                     Some(ctx.ct.clone()),
                     chunk_sink,
-                    None,
+                    run_as,
                 )
                 .await;
 
@@ -268,6 +278,18 @@ pub(crate) mod tests {
         )
     }
 
+    fn developer_tier_server(timeout: Duration, developer_identity: (u32, u32)) -> RedWrenchServer {
+        RedWrenchServer::new(
+            std::sync::Arc::new(PolicyEngine::new(crate::policy::tiers::rules_for_tier(
+                &crate::policy::tiers::TierName::Developer,
+            ))),
+            timeout,
+            "developer".to_string(),
+            Duration::from_secs(1800),
+            Some(developer_identity),
+        )
+    }
+
     /// Builds a real `RequestContext<RoleServer>` for `dispatch()`'s tests.
     ///
     /// NOTE (rmcp API adaptation): `RequestContext::new` is public, but
@@ -301,6 +323,66 @@ pub(crate) mod tests {
             .map(|t| t.text.clone())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_privilege_for_a_developer_tool_call() {
+        let user = nix::unistd::User::from_name("nobody")
+            .unwrap()
+            .expect("'nobody' must exist on the Fedora test environment this project requires");
+        let (uid, gid) = (user.uid.as_raw(), user.gid.as_raw());
+
+        let server = developer_tier_server(Duration::from_secs(5), (uid, gid));
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "run_command",
+                "sh",
+                vec!["-c".to_string(), "id -u".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        // dispatch() formats a successful result as "exit code: ...\nstdout:\n<output>\nstderr:\n",
+        // so asserting the dropped uid appears right after "stdout:\n" confirms
+        // it's the command's own reported identity, not a coincidental match
+        // elsewhere in the formatted text.
+        assert!(
+            text_of(&result).contains(&format!("stdout:\n{uid}")),
+            "expected the dropped uid ({uid}) in the command output, got: {}",
+            text_of(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_drop_privilege_for_a_non_developer_tool_call() {
+        // systemctl under the developer tier must behave exactly as it does
+        // under standard: root, unaffected by developer_identity being set.
+        // `systemctl status` is allowed under developer (inherited from
+        // standard/safe) but `systemctl` is not in DEVELOPER_TOOLS, so this
+        // call must not have privilege dropped. This test confirms the call
+        // reaches the executor at all (is not denied by policy), it cannot
+        // itself observe "ran as root" without a real systemctl target on the
+        // test machine, that is what the run_as_drops_privilege tests in
+        // executor.rs already cover for the mechanism itself.
+        let server = developer_tier_server(Duration::from_secs(5), (65534, 65534));
+        let (ctx, _guard) = test_request_context(&server);
+        let result = server
+            .dispatch(
+                "systemctl_status",
+                "systemctl",
+                vec!["status".to_string(), "sshd".to_string()],
+                ctx,
+                None,
+            )
+            .await;
+        assert!(
+            !text_of(&result).starts_with("Denied:"),
+            "systemctl status must still be allowed under developer tier, got: {}",
+            text_of(&result)
+        );
     }
 
     #[tokio::test]

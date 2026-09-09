@@ -206,3 +206,16 @@ argv vectors end-to-end. Run all three:
    **Expected:** allowed.
 5. Call `run_command` with `sar -o /tmp/evil.dat 1 5`.
    **Expected:** denied, the `-o` file-output flag is blocked.
+
+## Scenario 15: developer tier can write, compile, and run a trivial program, under a dropped identity
+
+1. Set `tier = "developer"` and `developer_user = "<a real, non-root account on the test machine>"` in `config.toml`. Start `redwrench`.
+2. From an MCP client, call `run_command` with `{"command": "bash", "args": ["-c", "cat > /home/<developer_user>/hello.c <<'EOF'\n#include <stdio.h>\nint main(void) { printf(\"hello world\\n\"); return 0; }\nEOF\ngcc /home/<developer_user>/hello.c -o /home/<developer_user>/hello && /home/<developer_user>/hello"]}`.
+3. **Expected:** the call succeeds, output includes `hello world`.
+4. On the target machine, while a longer-running variant of the same call is in flight (e.g. append `sleep 5` before the final run step), check `ps -o user= -p <pid>` for the `gcc`/`hello` process.
+   **Expected:** the process's user is `developer_user`, not `root`.
+
+## Scenario 16: developer tier cannot destroy the system, structurally
+
+1. With the same `developer` tier config as Scenario 15, call `run_command` with `{"command": "bash", "args": ["-c", "rm -rf /root"]}` (or another root-owned path the `developer_user` account has no write access to; do not actually target `/` itself even though the same principle applies, to avoid needing to rebuild the test machine if something about the test setup is wrong).
+2. **Expected:** the command runs (it is allowed by policy, `bash` is unconditionally allowed at this tier) but fails with a permissions error from `rm` itself (e.g. `rm: cannot remove '/root': Permission denied`), confirming the protection is the account's real Unix permissions, not a policy-level denial. Check the redwrench audit log for this call: it should show `decision="allowed"` (the policy engine permitted the call) with a nonzero exit code from `rm`, not `decision="denied"`, that distinction is what proves the guarantee is structural rather than pattern-matched.

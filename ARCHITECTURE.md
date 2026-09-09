@@ -12,8 +12,8 @@ decision.
    Streamable HTTP via `axum`. Every request passes a bind-address
    safety check at startup and a bearer-token check per-request before
    anything else runs.
-2. **Policy** (`src/policy/`): an ordered allow/deny rule list. Three
-   built-in tiers (`safe`, `standard`, `unrestricted`) live in
+2. **Policy** (`src/policy/`): an ordered allow/deny rule list. Four
+   built-in tiers (`safe`, `standard`, `developer`, `unrestricted`) live in
    `src/policy/tiers.rs`. `PolicyEngine::evaluate` is the single
    function every tool call passes through, there is no bypass.
 3. **Tools** (`src/tools/`): each file adds MCP tools to the shared

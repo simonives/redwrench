@@ -30,9 +30,9 @@ GNOME, or Server, and it needs no agent tooling installed on it
 directly.
 
 Every invocation passes through an ordered allow/deny policy engine and is
-written to the systemd journal, whether it was permitted or refused. Three
-built-in tiers (`safe`, `standard`, `unrestricted`) set the baseline, and
-custom rules layer on top without editing a line of code.
+written to the systemd journal, whether it was permitted or refused. Four
+built-in tiers (`safe`, `standard`, `developer`, `unrestricted`) set the
+baseline, and custom rules layer on top without editing a line of code.
 
 RedWrench is written in Rust. As it's a tool that spawns arbitrary processes,
 reads their output as it arrives, and enforces policy decisions up-front, it needs strict guarantees on memory bounds and
@@ -101,8 +101,14 @@ bind_address = "100.64.0.1:8443"
 # real one, e.g. `openssl rand -hex 32`. Never commit this file.
 bearer_token = "replace-me-with-a-long-random-string"
 
-# One of: safe, standard, unrestricted.
+# One of: safe, standard, developer, unrestricted.
 tier = "standard"
+
+# Required only when tier = "developer". The OS username developer-tier
+# tool execution (bash, python3, gcc, npm, cargo, etc.) runs as, instead
+# of root. The server refuses to start under the developer tier without
+# this set to a real account on the machine.
+developer_user = "your-username-here"
 
 # How long any single command may run before it is killed. Optional;
 # defaults to 30. Raise it if you run `dnf install` over a slow mirror.
@@ -140,9 +146,17 @@ it, so you narrow or widen any tier without editing the binary.
 | --- | --- |
 | `safe` | Read-only diagnostics: `systemctl status`/`is-active`/`is-enabled`, `journalctl` reads, `ping`, `ip` show/list/get. No mutation of system state. Journal-writing flags, flood/abuse ping flags (`-f`, `-A`, `-l`, `-s`, zero intervals), and systemctl flags that redirect the operation off this machine (`--host`/`-H`, `--machine`/`-M`, `--root`) are explicitly denied. |
 | `standard` | Everything in `safe`, plus service start/stop/restart/enable/disable and `dnf`/`rpm-ostree` install/remove/upgrade. Flags that defeat package signature checking (`--nogpgcheck`, `--repofrompath`, `--setopt`) are explicitly denied, including the abbreviated forms dnf's argparse CLI accepts. |
+| `developer` | Everything in `standard`, plus `bash`, `sh`, `python3`, `gcc`, `cc`, `node`, `npm`, `cargo`, and `make`, unconditionally (no argument restriction). These run under a configured `developer_user` account instead of root, not RedWrench's own filtering, that account's own Unix permissions are what bound the risk. Requires `developer_user` to be set in `config.toml`; the server refuses to start under this tier without it. |
 | `unrestricted` | Everything, including unfiltered raw command execution. No policy restrictions at all. |
 
 Switch tiers with `redwrench config set-tier <tier>`.
+
+`developer` hands the agent a real shell and a compiler toolchain, but
+never as root: every developer-tier call drops privilege to the
+`developer_user` account before it runs, so whatever damage a bad or
+adversarial command can do is bounded by that account's own file
+permissions, not by anything RedWrench filters. Pick an account with no
+more access than you're comfortable an agent using unsupervised.
 
 `unrestricted` is arbitrary remote code execution as whatever user
 RedWrench runs as. It is refused unless you pass

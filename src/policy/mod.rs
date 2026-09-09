@@ -1,5 +1,6 @@
 use regex::Regex;
 
+pub mod introspection;
 pub mod tiers;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

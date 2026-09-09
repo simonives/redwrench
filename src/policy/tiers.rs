@@ -246,7 +246,7 @@ const JOURNALCTL_MUTATION_FLAGS: &str =
 /// legitimate flag.
 const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o";
 
-fn safe_rules() -> Vec<Rule> {
+pub(crate) fn safe_rules() -> Vec<Rule> {
     vec![
         deny(
             "systemctl",
@@ -327,7 +327,7 @@ fn safe_rules() -> Vec<Rule> {
     ]
 }
 
-fn standard_rules() -> Vec<Rule> {
+pub(crate) fn standard_rules() -> Vec<Rule> {
     let mut rules = safe_rules();
     rules.extend(vec![
         allow(

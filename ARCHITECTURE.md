@@ -12,8 +12,8 @@ decision.
    Streamable HTTP via `axum`. Every request passes a bind-address
    safety check at startup and a bearer-token check per-request before
    anything else runs.
-2. **Policy** (`src/policy/`): an ordered allow/deny rule list. Three
-   built-in tiers (`safe`, `standard`, `unrestricted`) live in
+2. **Policy** (`src/policy/`): an ordered allow/deny rule list. Four
+   built-in tiers (`safe`, `standard`, `developer`, `unrestricted`) live in
    `src/policy/tiers.rs`. `PolicyEngine::evaluate` is the single
    function every tool call passes through, there is no bypass.
 3. **Tools** (`src/tools/`): each file adds MCP tools to the shared
@@ -56,6 +56,20 @@ decision.
    entry is written. Always argv-based (`tokio::process`), never a
    shell string.
 
+   It is also the only place a process runs as anyone other than
+   RedWrench itself. `execute()` takes an optional
+   `DeveloperIdentity` (uid, gid, name, home): when present, the child
+   drops to that identity in a `pre_exec` closure (supplementary groups
+   cleared, then `setgid`, then `setuid`) and gets that account's `HOME`,
+   `USER`, `LOGNAME`, and working directory. This is what bounds the
+   `developer` tier, its nine build-and-run tools are allowed
+   unconditionally by policy and constrained instead by the real Unix
+   permissions of the configured `developer_user`, not by command or
+   argument filtering. `dispatch` decides when to pass it (a
+   `DEVELOPER_TOOLS` command on a server with a resolved identity);
+   everything else, including `systemctl` and `dnf` under `developer`,
+   still runs as root.
+
 ## Adding a new tool
 
 1. Create `src/tools/your_tool.rs`.
@@ -72,6 +86,9 @@ decision.
 4. Add `pub mod your_tool;` to `src/tools/mod.rs`.
 5. If the tool should be reachable under `safe` or `standard`, add a
    corresponding rule in `src/policy/tiers.rs`, tools with no matching
-   rule are denied by every tier except `unrestricted`.
+   rule are denied by every tier except `unrestricted`. A command that
+   should additionally run unprivileged under `developer` needs its name
+   in that file's `DEVELOPER_TOOLS` list too, that list, not the rule
+   itself, is what `dispatch` matches to decide on the privilege drop.
 6. Write a manual smoke test the same way Tasks 10-13 in the
    implementation plan did, and add it to `docs/uat/v1-uat-scenarios.md`.

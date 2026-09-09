@@ -130,6 +130,7 @@ mod tests {
             Duration::from_secs(1800),
             tier,
             vec![],
+            None,
         )
     }
 

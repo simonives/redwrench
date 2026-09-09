@@ -203,6 +203,7 @@ mod tests {
             Duration::from_secs(1800),
             crate::policy::tiers::TierName::Unrestricted,
             vec![],
+            None,
         );
         let (ctx, _guard) = crate::tools::tests::test_request_context(&server);
 

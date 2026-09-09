@@ -239,6 +239,7 @@ pub(crate) mod tests {
                 command: String::new(),
                 arg_pattern: None,
                 effect: Effect::Allow,
+                description: "allow everything".to_string(),
             }])),
             timeout,
             "unrestricted".to_string(),

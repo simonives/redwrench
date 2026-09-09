@@ -2,7 +2,8 @@ use regex::Regex;
 
 pub mod tiers;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Effect {
     Allow,
     Deny,
@@ -13,6 +14,7 @@ pub struct Rule {
     pub command: String,
     pub arg_pattern: Option<Regex>,
     pub effect: Effect,
+    pub description: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -66,6 +68,7 @@ mod tests {
             command: command.to_string(),
             arg_pattern: arg_pattern.map(|p| Regex::new(p).unwrap()),
             effect,
+            description: "test rule".to_string(),
         }
     }
 

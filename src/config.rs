@@ -28,6 +28,8 @@ struct RawRule {
     command: String,
     arg_pattern: Option<String>,
     effect: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,13 +89,17 @@ impl Config {
                     }
                 }
                 Ok(Rule {
-                    command: r.command,
                     arg_pattern: r.arg_pattern.map(|p| regex::Regex::new(&p)).transpose()?,
                     effect: match r.effect.as_str() {
                         "allow" => Effect::Allow,
                         "deny" => Effect::Deny,
                         other => anyhow::bail!("unknown effect '{other}', expected 'allow' or 'deny'"),
                     },
+                    description: r
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("custom rule for '{}'", r.command)),
+                    command: r.command,
                 })
             })
             .collect::<anyhow::Result<Vec<Rule>>>()?;
@@ -178,6 +184,44 @@ mod tests {
         // first-match-wins. If this ever flips back to `.last()`, custom
         // deny rules become silently inert again.
         assert_eq!(rules.first().unwrap().command, "curl");
+    }
+
+    #[test]
+    fn a_custom_rule_with_an_explicit_description_loads_it_verbatim() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "safe"
+
+            [[custom_rules]]
+            command = "curl"
+            effect = "allow"
+            description = "fetch a URL for diagnostics"
+            "#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(
+            config.custom_rules[0].description,
+            "fetch a URL for diagnostics"
+        );
+    }
+
+    #[test]
+    fn a_custom_rule_without_a_description_gets_a_generated_default() {
+        let file = write_temp_config(
+            r#"
+            bind_address = "100.64.0.1:8443"
+            bearer_token = "test-token"
+            tier = "safe"
+
+            [[custom_rules]]
+            command = "curl"
+            effect = "allow"
+            "#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.custom_rules[0].description, "custom rule for 'curl'");
     }
 
     #[test]

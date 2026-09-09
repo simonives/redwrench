@@ -223,7 +223,10 @@ argv vectors end-to-end. Run all three:
 1. With `tier = "safe"`, call `check_command` with
    `{"command": "dnf", "args": ["list", "installed"]}`.
 2. **Expected:** `decision: "denied"`, a real reason, and
-   `would_be_allowed_at: "standard"`.
+   `would_be_allowed_at: "unrestricted"`. `standard`'s dnf rule only
+   matches `install`, `remove`, or `upgrade`, so `list installed` isn't
+   covered until `unrestricted` (the same class of hardware/package-listing
+   command issue #22 was originally about).
 3. Ask the connected agent "would `dnf list installed` be allowed?" and
    confirm it answers from this tool rather than attempting the real
    command to find out.

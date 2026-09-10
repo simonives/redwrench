@@ -132,7 +132,7 @@ mod tests {
         ));
         assert!(added_descriptions.contains("start, stop, restart, enable, or disable a unit"));
         assert!(added_descriptions.contains(
-            "reject --nogpgcheck/--repofrompath/--setopt/-c/--config/--installroot/--destdir/--downloaddir (bypasses package signature and repository trust, or operates against a different filesystem tree)"
+            "reject --nogpgcheck/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)"
         ));
         assert!(added_descriptions.contains("install, remove, or upgrade a package via dnf"));
         assert!(added_descriptions

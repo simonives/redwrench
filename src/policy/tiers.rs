@@ -179,31 +179,67 @@ const SYSTEMCTL_DANGEROUS_TARGETS: &str =
 /// allow pattern matches the leading subcommand only and says nothing
 /// about the flags that follow it.
 ///
-/// The patterns match *prefixes*, not the full flag names, for the same
-/// `allow_abbrev`-driven reason the original three alternatives do (dnf's
-/// CLI is argparse-based with unambiguous-prefix abbreviation on by
-/// default):
+/// (Round 2, live-verified against real dnf4 and dnf5 in a Fedora
+/// container, following a reviewer live-test that found two bypasses in
+/// the original pattern.) The long-flag alternatives match *prefixes*,
+/// not full flag names, for the same `allow_abbrev`-driven reason as
+/// before: dnf4's CLI is argparse-based with unambiguous-prefix
+/// abbreviation on by default. dnf5 takes only exact long-option names
+/// (confirmed live: `--con`, `--i`, `--des` and `--downloadd` are all
+/// rejected as "Unknown argument" on dnf5), so it needs no separate
+/// handling, every dnf5-valid full name is itself matched because these
+/// prefixes are prefixes of the full names too. Each prefix below is the
+/// shortest form confirmed live against dnf4's own option table
+/// (`dnf4 --help`), not assumed from the previous round:
 /// * `--nog`: the other `--no*` options are `--nobest`, `--nodocs`,
 ///   `--noautoremove` and `--noplugins`, so `--nog` already resolves
 ///   uniquely to `--nogpgcheck`.
 /// * `--repof`: `--repo` is itself a real option, so the shortest
 ///   unambiguous prefix of `--repofrompath` is one character longer.
 /// * `--set`: no other dnf option begins `--set`.
-/// * `-c`/`--conf`: dnf has no other `-c` short option, and `--config`
-///   is the only long option beginning `--conf`.
-/// * `--installroot`: no other dnf option shares this prefix at any
-///   useful abbreviation length, matched in full since a short prefix
-///   here would risk matching an unrelated future option too eagerly.
-/// * `--destdir`/`--downloaddir`: matched in full for the same reason.
+/// * `--con`: dnf4 reports `--co` as ambiguous against `--color` and
+///   `--comment`, so `--con` is the shortest prefix that resolves
+///   uniquely to `--config` (verified live: `--con /path` produced dnf4's
+///   config-file-not-found error; the original round's `--conf` was one
+///   letter longer than necessary).
+/// * `--i`: dnf4 has exactly one long option beginning with `i`
+///   (`--installroot`), so the single-letter prefix `--i` already
+///   resolves uniquely (verified live: `--i=/path install pkg` skipped
+///   dnf4's config-file parsing and went straight to release-version
+///   detection, the same behaviour as `--installroot`). This is far
+///   shorter than the original round's `--installr`, which was a good
+///   enough fix for that specific reviewer payload but not the true
+///   floor; re-verify this one first if a future dnf4 release adds
+///   another `--i*` long option, since that would make `--i` ambiguous
+///   and change the actual shortest prefix.
+/// * `--des`: dnf4 reports `--de` as ambiguous against `--debuglevel` and
+///   `--debugsolver`, so `--des` is the shortest prefix that resolves
+///   uniquely to `--destdir`.
+/// * `--downloadd`: dnf4 reports `--down`, `--downl`, `--downlo` and
+///   `--downloa` as all ambiguous against `--downloadonly`, so
+///   `--downloadd` (matching the original round's value) is the actual
+///   shortest unambiguous prefix for `--downloaddir`.
+/// * `-[A-Za-z]*c`: (issue #41 round 2) dnf accepts clustered short
+///   options, so `-yc` and `-cy` both reach the same `-c` that
+///   `--config` reaches, exactly the clustered-short-option shape
+///   `PING_ABUSE_FLAGS` and `TOP_DISCLOSURE_FLAGS` already handle for
+///   their own tools. Verified live on both dnf4 and dnf5: `-yc <path>`
+///   and `-cy <path>` each consumed `-c` as the config flag. No other
+///   dnf short option is a lowercase `c` (`-C`/`--cacheonly` is a
+///   distinct, case-sensitive option this pattern does not touch), so
+///   nothing legitimate is caught by requiring only that a hyphen-led
+///   token contain a `c` somewhere after the leading run of letters.
 ///
 /// Requiring the leading `--`/`-` keeps these short prefixes from
 /// matching a package name that merely happens to contain the same
 /// letters. The whole alternation is anchored to a `(?:^|\s)` token
 /// boundary, the same style `SYSTEMCTL_HOST_REDIRECT_FLAGS` uses, so a
 /// package name or argument value that merely *contains* one of these
-/// substrings mid-word is not denied.
+/// substrings mid-word, or a positional argument that merely contains
+/// the letter `c` without a leading hyphen (e.g. `myconfigtool`,
+/// `gcc-package`), is not denied.
 const DNF_TRUST_BYPASS_FLAGS: &str =
-    r"(?:^|\s)(?:--nog|--repof|--set|-c\b|--conf|--installroot|--destdir|--downloaddir)";
+    r"(?:^|\s)(?:--nog|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z]*c)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -471,7 +507,7 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
         deny(
             "dnf",
             DNF_TRUST_BYPASS_FLAGS,
-            "reject --nogpgcheck/--repofrompath/--setopt/-c/--config/--installroot/--destdir/--downloaddir (bypasses package signature and repository trust, or operates against a different filesystem tree)",
+            "reject --nogpgcheck/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)",
         ),
         allow(
             "dnf",
@@ -1487,6 +1523,16 @@ mod tests {
 
         // (issue #41) The confirmed bypass: an alternate config achieves
         // --nogpgcheck + --repofrompath together with no denied flag.
+        //
+        // (issue #41, round 2) A reviewer live-test against real dnf4 and
+        // dnf5 in a Fedora container found three additional confirmed
+        // bypasses of the round-1 fix, added below: short-option
+        // clustering (`-yc`/`-cy`) reaches `-c` without a bare `-c`
+        // token; `--con` (not `--conf`) is dnf4's actual shortest
+        // unambiguous prefix for `--config`; and dnf's own
+        // prefix-abbreviation resolves `--installr=`/`--destd=`/
+        // `--downloadd=` to their full options, so matching only the
+        // complete flag names let any shorter unambiguous prefix through.
         for args in [
             vec![
                 "install".to_string(),
@@ -1515,6 +1561,47 @@ mod tests {
                 "--downloaddir=/tmp/evil".to_string(),
                 "pkg".to_string(),
             ],
+            // Round 2: clustered short options, verified live against
+            // both dnf4 and dnf5 (`-yc /path` and `-cy /path` both
+            // consumed `-c` as the config flag).
+            vec![
+                "install".to_string(),
+                "-yc".to_string(),
+                "/tmp/evil.conf".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "-cy".to_string(),
+                "/tmp/evil.conf".to_string(),
+                "pkg".to_string(),
+            ],
+            // Round 2: `--con`, one letter shorter than `--conf`, is
+            // dnf4's real shortest unambiguous prefix for `--config`
+            // (`--co` is ambiguous against `--color`/`--comment`).
+            vec![
+                "install".to_string(),
+                "--con".to_string(),
+                "/tmp/evil.conf".to_string(),
+                "pkg".to_string(),
+            ],
+            // Round 2: dnf's prefix-abbreviation resolves these shorter
+            // forms to the full flags, verified live on dnf4.
+            vec![
+                "install".to_string(),
+                "--installr=/mnt/other".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--destd=/tmp/evil".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--downloadd=/tmp/evil".to_string(),
+                "pkg".to_string(),
+            ],
         ] {
             assert!(
                 matches!(engine.evaluate("dnf", &args), Decision::Denied(_)),
@@ -1532,6 +1619,17 @@ mod tests {
         // "installroot" as a substring, not as the flag itself, stays allowed.
         assert!(matches!(
             engine.evaluate("dnf", &["install".into(), "myconfigtool".into()]),
+            Decision::Allowed
+        ));
+
+        // Substring safety (round 2): the clustered-short-option pattern
+        // must not deny a legitimate flag or package name that merely
+        // contains the letter "c" without a leading hyphen driving it.
+        // `-y` (assumeyes) alone has no "c" in it, and "gcc" as a bare
+        // positional package name never starts with a hyphen, so neither
+        // should trip `-[A-Za-z]*c`.
+        assert!(matches!(
+            engine.evaluate("dnf", &["install".into(), "-y".into(), "gcc".into()]),
             Decision::Allowed
         ));
     }

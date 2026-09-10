@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/) from `1.0.0` onward.
 
+## [1.0.1] - 2026-09-10
+
+A security patch closing five findings from an independent tier-charter audit (`docs/superpowers/specs/2026-09-10-tier-charter-audit.md`), all affecting `v1.0.0`. Two of the five affect every tier except `unrestricted`, since every tier inherits `safe`'s rules.
+
+### Fixed
+
+- **#38, critical**: `journalctl`'s bare `+` disjunction operator let a query carry a real, glob-free unit scope while OR-combining it with other appended match expressions, reopening a whole-journal read at `safe` tier by a route the original `#26` fix didn't anticipate.
+- **#39, high**: `top -b -c` at `safe` tier disclosed every process's full command line, system-wide, as root, the same confidentiality class as `#26`, never previously scoped.
+- **#40, high**: `standard` tier could reboot, power off, or drop the host to single-user mode via `systemctl start`/`restart` against `reboot.target`/`poweroff.target`/`halt.target`/`emergency.target`/`rescue.target`, ordinary service-lifecycle syntax the tier's own allow pattern didn't distinguish from a real service.
+- **#41, critical**: `dnf -c`/`--config` (and several other flags) were not covered by the package-trust-bypass deny, letting an alternate config file achieve `--nogpgcheck` and `--repofrompath` together with no denied flag involved, a full root-escalation chain under `developer` tier. Closed across three review rounds after live testing against real `dnf4`/`dnf5` binaries surfaced clustered short options (`-yc`, `-4c`), dnf's prefix-abbreviation (`--con`, `--i`, `--des`), and a digit-inclusive character class the first two fixes missed.
+- **#42, critical**: a `custom_rules` entry unconditionally allowing a command (e.g. `bash`) under `safe`/`standard` tier granted unfiltered root code execution with no warning and no `--i-understand-the-risk` requirement, since those tiers have no privilege-drop mechanism. RedWrench now refuses to start on such a configuration without the flag. Closed across two rounds after review found a catch-all `arg_pattern` (`.*`, `^`, `$`) was functionally unconditional but technically distinct from the unconditional (`None`) case the first fix checked for.
+
 ## [1.0.0] - 2026-09-10
 
 The first tagged release. RedWrench exposes Fedora hardware and OS control to AI coding agents over MCP, behind a tiered, ordered allow/deny policy engine, with every invocation recorded to the systemd journal.

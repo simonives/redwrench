@@ -150,19 +150,47 @@ const PING_ABUSE_FLAGS: &str = concat!(
 /// same letters.
 const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro|im)|(?:^|\s)-[A-Za-z]*[HM]";
 
-/// (issue #40) `systemctl start` (and `restart`) against these five target
-/// names reboots, powers off, halts, or drops the host to single-user
-/// (`rescue.target`) or minimal (`emergency.target`) mode. Each is
-/// ordinary service-lifecycle syntax naming a target instead of a
-/// service, so it matches `standard` tier's `^(start|stop|restart|...)`
-/// allow with no other change to the argument shape. `systemctl kill` and
-/// `systemctl isolate` were already excluded from the verb list, this
-/// closes the equivalent outcomes reachable via `start`/`restart`
-/// instead. Anchored to `\.target\b` so a real service unit whose name
-/// merely contains one of these words as a substring (unlikely, but not
-/// impossible) is unaffected.
-const SYSTEMCTL_DANGEROUS_TARGETS: &str =
-    r"(?:^|\s)(?:reboot|poweroff|halt|emergency|rescue)\.target\b";
+/// (issue #40, structural fix after a reopen) `systemctl start` (and
+/// `restart`) against a `.target` unit reaches outcomes the tier's
+/// service-lifecycle charter never intended: reboot, power-off, halt, or
+/// dropping the host to single-user or minimal mode. The original fix
+/// named five targets directly (`reboot`, `poweroff`, `halt`,
+/// `emergency`, `rescue`.target), but a reviewer live-test against real
+/// systemd 259 (Fedora 44) found eight more shipped equivalents reachable
+/// the same way and matched by `standard` tier's own
+/// `^(start|stop|restart|...)` allow: `runlevel6.target` (a symlink to
+/// `reboot.target`, confirmed live), `runlevel0.target` (→
+/// `poweroff.target`), `runlevel1.target` (→ `rescue.target`),
+/// `ctrl-alt-del.target` (→ `reboot.target`), `kexec.target` (reboot via
+/// kexec), `soft-reboot.target` (userspace reboot), `factory-reset.target`,
+/// and `exit.target` (manager shutdown). A literal name list cannot keep
+/// up with this: systemd ships new shutdown-shaped targets across
+/// releases, and every runlevel alias, `ctrl-alt-del` binding, and future
+/// equivalent would need its own entry added by hand, each one a fresh
+/// chance to reopen this issue exactly as it was reopened here.
+///
+/// The structural fix: deny any `.target` argument outright under the
+/// lifecycle verbs, rather than naming targets one at a time. A target
+/// groups units and can represent a boot, shutdown, or runlevel state in
+/// ways a literal name list can never fully enumerate; `standard` tier's
+/// charter is service management, i.e. actual services, not targets, so
+/// scoping its lifecycle verbs to non-target arguments matches what the
+/// tier is meant to permit rather than trying to guess which target names
+/// are dangerous today. An operator who genuinely needs to start a custom
+/// `.target` unit can do so via `custom_rules`, which sit in front of the
+/// tier and can grant exactly that one unit.
+///
+/// Matches the literal substring `.target` anywhere in the joined
+/// argument string, anchored the same `(?:^|\s)` token-boundary way as
+/// every other deny in this file, then requiring the boundary followed by
+/// non-whitespace up to and including `.target`, so a real service unit
+/// whose own name happens to contain the substring `.target` (unlikely,
+/// but not impossible, e.g. a unit literally named `my.target.service`)
+/// is still denied, the same conservative bias `SAR_FILE_OUTPUT_FLAG`
+/// takes toward its own attached-argument form: denying a constructed
+/// edge case nobody has a legitimate reason to hit is a smaller cost than
+/// missing a real bypass.
+const SYSTEMCTL_TARGET_LIFECYCLE: &str = r"(?:^|\s)\S*\.target\b";
 
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
@@ -186,14 +214,38 @@ const SYSTEMCTL_DANGEROUS_TARGETS: &str =
 /// before: dnf4's CLI is argparse-based with unambiguous-prefix
 /// abbreviation on by default. dnf5 takes only exact long-option names
 /// (confirmed live: `--con`, `--i`, `--des` and `--downloadd` are all
-/// rejected as "Unknown argument" on dnf5), so it needs no separate
-/// handling, every dnf5-valid full name is itself matched because these
-/// prefixes are prefixes of the full names too. Each prefix below is the
-/// shortest form confirmed live against dnf4's own option table
-/// (`dnf4 --help`), not assumed from the previous round:
+/// rejected as "Unknown argument" on dnf5), so most of these prefixes
+/// need no separate handling for dnf5, since every dnf5-valid full name
+/// they cover is itself matched because the prefix is a prefix of the
+/// full name too. The gpg-check bypass is the one exception: dnf5 ships
+/// it under two genuinely distinct spellings, not one name reachable by
+/// abbreviation, so both need their own coverage (see the `--nog`/
+/// `--no-g` pair below). Each prefix below is the shortest form
+/// confirmed live against dnf4's own option table (`dnf4 --help`), not
+/// assumed from the previous round:
 /// * `--nog`: the other `--no*` options are `--nobest`, `--nodocs`,
 ///   `--noautoremove` and `--noplugins`, so `--nog` already resolves
-///   uniquely to `--nogpgcheck`.
+///   uniquely to `--nogpgcheck`. dnf5 also accepts `--nogpgcheck`, as a
+///   documented alias of its own `--no-gpgchecks`, so this prefix
+///   catches dnf5's alias spelling too, confirmed live.
+/// * `--no-g`: (round 4, critical, reviewer live-test against real dnf5
+///   5.4.3) dnf5's own long-option spelling for the same bypass is
+///   `--no-gpgchecks`, hyphenated and pluralised, a name in its own
+///   right rather than an abbreviation of `--nogpgcheck`. dnf5 does not
+///   do prefix abbreviation at all (confirmed live: `--no-g` alone is
+///   rejected as "Unknown argument"), so `--nog` cannot reach this
+///   spelling, the hyphen after `no` breaks the match. dnf5 is Fedora's
+///   default `dnf` on Fedora 41+ (this project targets Fedora, so this
+///   is the default, most-likely-to-be-hit spelling on the actual
+///   deployment target), so leaving it uncovered defeated the trust-
+///   bypass deny entirely for the common case. Confirmed live that
+///   `--no-g` is dnf5's only long option beginning `--no-g` (`dnf5
+///   --help` lists `--no-best`, `--no-allow-vendor-change`, `--no-docs`,
+///   `--no-gpgchecks`, `--no-plugins` and their `--noX` aliases; only
+///   `--no-gpgchecks` starts `--no-g`), and confirmed dnf4 has no
+///   hyphenated `--no-*` options at all and rejects `--no-gpgchecks`
+///   outright as unrecognised, so this alternative closes dnf5's
+///   spelling without affecting dnf4 in either direction.
 /// * `--repof`: `--repo` is itself a real option, so the shortest
 ///   unambiguous prefix of `--repofrompath` is one character longer.
 /// * `--set`: no other dnf option begins `--set`.
@@ -243,7 +295,7 @@ const SYSTEMCTL_DANGEROUS_TARGETS: &str =
 /// the letter `c` without a leading hyphen (e.g. `myconfigtool`,
 /// `gcc-package`), is not denied.
 const DNF_TRUST_BYPASS_FLAGS: &str =
-    r"(?:^|\s)(?:--nog|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z0-9]*c)";
+    r"(?:^|\s)(?:--nog|--no-g|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z0-9]*c)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -500,8 +552,8 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
     rules.extend(vec![
         deny(
             "systemctl",
-            SYSTEMCTL_DANGEROUS_TARGETS,
-            "reject start/restart against reboot/poweroff/halt/emergency/rescue targets (reboots, powers off, halts, or drops to single-user mode)",
+            SYSTEMCTL_TARGET_LIFECYCLE,
+            "reject start/restart against any .target unit (targets group units and can represent boot/shutdown/runlevel states a literal name list cannot fully enumerate; standard tier's lifecycle verbs are scoped to actual services, not targets)",
         ),
         allow(
             "systemctl",
@@ -511,7 +563,7 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
         deny(
             "dnf",
             DNF_TRUST_BYPASS_FLAGS,
-            "reject --nogpgcheck/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)",
+            "reject --nogpgcheck/--no-gpgchecks/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)",
         ),
         allow(
             "dnf",
@@ -685,10 +737,12 @@ mod tests {
     }
 
     #[test]
-    fn standard_tier_denies_reboot_and_halt_targets_but_allows_ordinary_service_control() {
+    fn standard_tier_denies_any_target_lifecycle_but_allows_ordinary_service_control() {
         let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
 
-        // (issue #40) Each of the five confirmed targets, via start.
+        // (issue #40) The five originally confirmed targets, via start and
+        // restart, now denied for the broader structural reason (any
+        // `.target` argument, not five hardcoded names).
         for target in ["reboot", "poweroff", "halt", "emergency", "rescue"] {
             let args = vec!["start".to_string(), format!("{target}.target")];
             assert!(
@@ -706,13 +760,42 @@ mod tests {
             );
         }
 
-        // Regression: ordinary service control remains allowed.
+        // (issue #40, reopen) Eight further shipped equivalents, live-found
+        // on real systemd 259 (Fedora 44) reachable the same way and not
+        // covered by the original five-name list: runlevel aliases, the
+        // ctrl-alt-del binding, kexec/soft reboots, a factory reset, and
+        // manager exit. The literal-name list this replaces would have
+        // needed a fresh entry for each of these; the structural `.target`
+        // deny closes all of them without naming any of them.
+        for target in [
+            "runlevel6",     // symlink to reboot.target
+            "runlevel0",     // symlink to poweroff.target
+            "runlevel1",     // symlink to rescue.target
+            "ctrl-alt-del",  // symlink to reboot.target
+            "kexec",         // reboot via kexec
+            "soft-reboot",   // userspace reboot
+            "factory-reset", // factory reset on next boot
+            "exit",          // manager shutdown
+        ] {
+            let args = vec!["start".to_string(), format!("{target}.target")];
+            assert!(
+                matches!(engine.evaluate("systemctl", &args), Decision::Denied(_)),
+                "systemctl start {target}.target should be denied under standard tier"
+            );
+        }
+
+        // Regression: ordinary service control remains allowed, including
+        // an explicit `.service` suffix, a real unit, not a target.
         assert!(matches!(
             engine.evaluate("systemctl", &["start".into(), "sshd".into()]),
             Decision::Allowed
         ));
         assert!(matches!(
             engine.evaluate("systemctl", &["stop".into(), "sshd".into()]),
+            Decision::Allowed
+        ));
+        assert!(matches!(
+            engine.evaluate("systemctl", &["start".into(), "sshd.service".into()]),
             Decision::Allowed
         ));
     }
@@ -1619,6 +1702,18 @@ mod tests {
             vec![
                 "install".to_string(),
                 "--downloadd=/tmp/evil".to_string(),
+                "pkg".to_string(),
+            ],
+            // Round 4 (critical): dnf5's own long-option spelling for the
+            // gpg-check bypass, `--no-gpgchecks`, live-verified on real
+            // dnf5 5.4.3 (`dnf5 --no-gpgchecks install htop` disabled
+            // signature verification and proceeded). The old `--nog`
+            // alternative does not reach it, the hyphen after `no` breaks
+            // the match, and dnf5 does not do prefix abbreviation at all,
+            // so nothing else in this alternation covered it either.
+            vec![
+                "install".to_string(),
+                "--no-gpgchecks".to_string(),
                 "pkg".to_string(),
             ],
         ] {

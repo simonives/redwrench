@@ -123,16 +123,18 @@ mod tests {
         // (issue #26) standard_rules() also restores the unscoped
         // journalctl read safe_rules() no longer allows. (issue #40) it
         // further adds a deny rejecting systemctl start/restart against
-        // reboot/poweroff/halt/emergency/rescue targets, ahead of the
-        // existing systemctl start/stop/... allow. So standard adds six
-        // rules over safe, not five.
+        // any .target unit (a structural fix, not a hardcoded name list,
+        // after a reopen found eight more shipped equivalents the
+        // original five-name list missed), ahead of the existing
+        // systemctl start/stop/... allow. So standard adds six rules over
+        // safe, not five.
         assert_eq!(added.len(), 6);
         assert!(added_descriptions.contains(
-            "reject start/restart against reboot/poweroff/halt/emergency/rescue targets (reboots, powers off, halts, or drops to single-user mode)"
+            "reject start/restart against any .target unit (targets group units and can represent boot/shutdown/runlevel states a literal name list cannot fully enumerate; standard tier's lifecycle verbs are scoped to actual services, not targets)"
         ));
         assert!(added_descriptions.contains("start, stop, restart, enable, or disable a unit"));
         assert!(added_descriptions.contains(
-            "reject --nogpgcheck/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)"
+            "reject --nogpgcheck/--no-gpgchecks/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)"
         ));
         assert!(added_descriptions.contains("install, remove, or upgrade a package via dnf"));
         assert!(added_descriptions

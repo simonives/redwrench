@@ -22,7 +22,7 @@ Found by an independent tier-charter audit ([docs/superpowers/specs/2026-09-10-t
 
 ### v1.1, policy engine polish
 
-Coverage and completeness work on an already-functional system, no new capability, closing gaps. Extended with the tier-charter audit's remaining findings (medium and low severity, plus documentation drift), alongside the pre-existing polish items.
+Coverage and completeness work on an already-functional system, no new capability, closing gaps. Extended with the tier-charter audit's remaining findings (medium and low severity, plus documentation drift), alongside the pre-existing polish items, and with the surviving findings from an independent cross-model review (#65-#69, an external agy/GPT-OSS pass over the whole repo; most of that pass's higher-severity security claims didn't survive verification against the actual code and aren't included, only the test-coverage and packaging gaps that checked out).
 
 - [#22](https://github.com/simonives/redwrench/issues/22): hardware inventory commands (`lscpu`, `uname`, `free`, `lsblk`, `df`) added to `safe` tier
 - [#25](https://github.com/simonives/redwrench/issues/25): `run_command` shouldn't silently block for the full timeout on an unbounded command when no streaming client is attached
@@ -45,6 +45,11 @@ Coverage and completeness work on an already-functional system, no new capabilit
 - [#58](https://github.com/simonives/redwrench/issues/58): a `custom_rules` allow silently disables that command's tier-hardening denies with no warning
 - [#59](https://github.com/simonives/redwrench/issues/59): `custom_rules` command values with surrounding whitespace load successfully but are permanently inert
 - [#60](https://github.com/simonives/redwrench/issues/60): `additional_rules`' description-based deduplication could collide across tiers
+- [#65](https://github.com/simonives/redwrench/issues/65): test coverage for `systemctl_control` unit-name case-sensitivity
+- [#66](https://github.com/simonives/redwrench/issues/66): test coverage for malformed bind-address handling
+- [#67](https://github.com/simonives/redwrench/issues/67): test coverage for an unknown top-level `config.toml` field
+- [#68](https://github.com/simonives/redwrench/issues/68): evaluate `ProtectSystem=full`/`PrivateTmp=yes` for the systemd unit
+- [#69](https://github.com/simonives/redwrench/issues/69): post-install reminder to set a bearer token
 
 ### v1.2, packaging and distribution
 

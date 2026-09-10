@@ -293,6 +293,17 @@ const JOURNALCTL_PLUS_DISJUNCTION: &str = r"(?:^|\s)\+(?:\s|$)";
 /// legitimate flag.
 const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o";
 
+/// (issue #39) `top -c` switches to full command-line display. Since
+/// RedWrench runs as root, `top -b -c` at `safe` tier discloses every
+/// process's complete argv system-wide, the same confidentiality class as
+/// issue #26's unscoped journalctl read, never scoped for `top`. The
+/// pattern matches `-c` in a clustered short-option group too (e.g.
+/// `-bc`), the same clustered-form awareness `PING_ABUSE_FLAGS` uses,
+/// since `top` accepts clustered single-letter flags. No other `top`
+/// option this tier's `^-b` allow reaches uses the letter `c`, so nothing
+/// legitimate is rejected.
+const TOP_DISCLOSURE_FLAGS: &str = r"(?:^|\s)-[A-Za-z]*c";
+
 pub(crate) fn safe_rules() -> Vec<Rule> {
     vec![
         deny(
@@ -408,6 +419,11 @@ pub(crate) fn safe_rules() -> Vec<Rule> {
         // to interactive mode. The pattern is left loose deliberately
         // rather than anchored to `^-b(\s|$)`, since the failure mode of
         // over-matching here is "top errors out," not a policy bypass.
+        deny(
+            "top",
+            TOP_DISCLOSURE_FLAGS,
+            "reject -c (discloses every process's full command line, including any credentials passed via argv)",
+        ),
         allow(
             "top",
             Some(r"^-b"),
@@ -870,6 +886,28 @@ mod tests {
         assert!(matches!(
             engine.evaluate("journalctl", &["-u*".into()]),
             Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_top_full_command_line_disclosure_but_allows_ordinary_batch_mode() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+
+        // (issue #39) The confirmed disclosure: -c in both separate and
+        // clustered forms.
+        assert!(matches!(
+            engine.evaluate("top", &["-b".into(), "-c".into(), "-n".into(), "1".into()]),
+            Decision::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate("top", &["-bc".into(), "-n".into(), "1".into()]),
+            Decision::Denied(_)
+        ));
+
+        // Regression: ordinary batch-mode usage without -c remains allowed.
+        assert!(matches!(
+            engine.evaluate("top", &["-b".into(), "-n".into(), "1".into()]),
+            Decision::Allowed
         ));
     }
 

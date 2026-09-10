@@ -190,7 +190,36 @@ const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro|im)|(?:^|\s
 /// takes toward its own attached-argument form: denying a constructed
 /// edge case nobody has a legitimate reason to hit is a smaller cost than
 /// missing a real bypass.
-const SYSTEMCTL_TARGET_LIFECYCLE: &str = r"(?:^|\s)\S*\.target\b";
+///
+/// (#40, second reopen, critical) The `.target`-only version of this rule
+/// reasoned about the wrong class. The outcome that matters is "a unit
+/// whose success terminates the system", and systemd ships that outcome
+/// as plain `.service` units too, with no `.target` anywhere in argv:
+/// `systemd-poweroff.service`, `systemd-reboot.service`,
+/// `systemd-halt.service`, `systemd-kexec.service`,
+/// `systemd-soft-reboot.service`, and `systemd-exit.service` are each a
+/// `Type=oneshot` with no `ExecStart` that succeeds instantly and fires a
+/// `SuccessAction=`/`FailureAction=` directive
+/// (poweroff-force/reboot-force/halt-force/kexec-force/
+/// soft-reboot-force/exit-force) doing exactly what the unit's name says.
+/// `systemd-factory-reset-reboot.service` and `system-update-cleanup.service`
+/// do the same via `SuccessAction=reboot`. A reviewer live-verified this
+/// against real systemd 259 (Fedora 44): `systemctl start
+/// systemd-poweroff.service` reached the exact argv `systemctl_control`
+/// constructs and powered off a running system, with no `.target`
+/// involved and no custom_rules needed. This is the same severity and the
+/// same reachable-with-no-configuration shape the original `#40` finding
+/// described, just via a `.service` unit instead of a `.target` one, so
+/// it is denied here by name alongside the structural `.target` deny
+/// rather than folded into a broader structural pattern: unlike targets
+/// (which are a real, open-ended systemd category), this is a short,
+/// fixed list of systemd's own shutdown-action service units, not
+/// something third-party packages add to routinely.
+const SYSTEMCTL_TARGET_LIFECYCLE: &str = concat!(
+    r"(?:^|\s)(?:\S*\.target",
+    r"|systemd-(?:poweroff|reboot|halt|kexec|soft-reboot|exit|factory-reset-reboot)\.service",
+    r"|system-update-cleanup\.service)\b"
+);
 
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
@@ -553,7 +582,7 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
         deny(
             "systemctl",
             SYSTEMCTL_TARGET_LIFECYCLE,
-            "reject start/restart against any .target unit (targets group units and can represent boot/shutdown/runlevel states a literal name list cannot fully enumerate; standard tier's lifecycle verbs are scoped to actual services, not targets)",
+            "reject start/stop/restart/enable/disable against any .target unit, or against systemd's own shutdown-action service units (systemd-poweroff/-reboot/-halt/-kexec/-soft-reboot/-exit/-factory-reset-reboot.service, system-update-cleanup.service), all of which reboot, power off, halt, or otherwise terminate the host regardless of tier restrictions",
         ),
         allow(
             "systemctl",
@@ -796,6 +825,48 @@ mod tests {
         ));
         assert!(matches!(
             engine.evaluate("systemctl", &["start".into(), "sshd.service".into()]),
+            Decision::Allowed
+        ));
+    }
+
+    #[test]
+    fn standard_tier_denies_shutdown_action_service_units_with_no_target_in_argv() {
+        // (issue #40, second reopen, critical) A reviewer live-verified
+        // against real systemd 259 (Fedora 44) that these plain .service
+        // units terminate the host via their own SuccessAction=/
+        // FailureAction= directives, with no `.target` anywhere in argv,
+        // so the structural `.target`-only deny waved every one of them
+        // through. `systemctl start systemd-poweroff.service` was
+        // live-confirmed to power off a running system through the exact
+        // argv systemctl_control constructs.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for unit in [
+            "systemd-poweroff.service",
+            "systemd-reboot.service",
+            "systemd-halt.service",
+            "systemd-kexec.service",
+            "systemd-soft-reboot.service",
+            "systemd-exit.service",
+            "systemd-factory-reset-reboot.service",
+            "system-update-cleanup.service",
+        ] {
+            let args = vec!["start".to_string(), unit.to_string()];
+            assert!(
+                matches!(engine.evaluate("systemctl", &args), Decision::Denied(_)),
+                "systemctl start {unit} should be denied under standard tier"
+            );
+        }
+
+        // Regression: a real service whose name merely starts with
+        // "systemd-" but isn't one of the shutdown-action units remains
+        // allowed (e.g. systemd-journald isn't managed this way in
+        // practice, but the point is the alternation doesn't over-match
+        // the "systemd-" prefix generally).
+        assert!(matches!(
+            engine.evaluate(
+                "systemctl",
+                &["start".into(), "systemd-journald.service".into()]
+            ),
             Decision::Allowed
         ));
     }

@@ -219,16 +219,20 @@ const SYSTEMCTL_DANGEROUS_TARGETS: &str =
 ///   `--downloa` as all ambiguous against `--downloadonly`, so
 ///   `--downloadd` (matching the original round's value) is the actual
 ///   shortest unambiguous prefix for `--downloaddir`.
-/// * `-[A-Za-z]*c`: (issue #41 round 2) dnf accepts clustered short
-///   options, so `-yc` and `-cy` both reach the same `-c` that
-///   `--config` reaches, exactly the clustered-short-option shape
-///   `PING_ABUSE_FLAGS` and `TOP_DISCLOSURE_FLAGS` already handle for
-///   their own tools. Verified live on both dnf4 and dnf5: `-yc <path>`
-///   and `-cy <path>` each consumed `-c` as the config flag. No other
-///   dnf short option is a lowercase `c` (`-C`/`--cacheonly` is a
-///   distinct, case-sensitive option this pattern does not touch), so
-///   nothing legitimate is caught by requiring only that a hyphen-led
-///   token contain a `c` somewhere after the leading run of letters.
+/// * `-[A-Za-z0-9]*c`: (issue #41 round 2, widened in round 3) dnf
+///   accepts clustered short options, so `-yc` and `-cy` both reach the
+///   same `-c` that `--config` reaches, exactly the clustered-short-option
+///   shape `PING_ABUSE_FLAGS` and `TOP_DISCLOSURE_FLAGS` already handle
+///   for their own tools. Verified live on both dnf4 and dnf5: `-yc
+///   <path>` and `-cy <path>` each consumed `-c` as the config flag.
+///   dnf4 also has two digit short options (`-4`, `-6`), so a
+///   letters-only character class (`[A-Za-z]*`) still let `-4c <path>`
+///   and `-6c <path>` through, verified live the same way. The class
+///   now includes digits to close that too. No other dnf short option is
+///   a lowercase `c` (`-C`/`--cacheonly` is a distinct, case-sensitive
+///   option this pattern does not touch), so nothing legitimate is
+///   caught by requiring only that a hyphen-led token contain a `c`
+///   somewhere after a leading run of letters and digits.
 ///
 /// Requiring the leading `--`/`-` keeps these short prefixes from
 /// matching a package name that merely happens to contain the same
@@ -239,7 +243,7 @@ const SYSTEMCTL_DANGEROUS_TARGETS: &str =
 /// the letter `c` without a leading hyphen (e.g. `myconfigtool`,
 /// `gcc-package`), is not denied.
 const DNF_TRUST_BYPASS_FLAGS: &str =
-    r"(?:^|\s)(?:--nog|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z]*c)";
+    r"(?:^|\s)(?:--nog|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z0-9]*c)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -1576,6 +1580,21 @@ mod tests {
                 "/tmp/evil.conf".to_string(),
                 "pkg".to_string(),
             ],
+            // Round 3: dnf4's digit short options (-4, -6) cluster with
+            // -c too, verified live; a letters-only character class
+            // missed these.
+            vec![
+                "install".to_string(),
+                "-4c".to_string(),
+                "/tmp/evil.conf".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "-6c".to_string(),
+                "/tmp/evil.conf".to_string(),
+                "pkg".to_string(),
+            ],
             // Round 2: `--con`, one letter shorter than `--conf`, is
             // dnf4's real shortest unambiguous prefix for `--config`
             // (`--co` is ambiguous against `--color`/`--comment`).
@@ -1622,12 +1641,12 @@ mod tests {
             Decision::Allowed
         ));
 
-        // Substring safety (round 2): the clustered-short-option pattern
-        // must not deny a legitimate flag or package name that merely
-        // contains the letter "c" without a leading hyphen driving it.
-        // `-y` (assumeyes) alone has no "c" in it, and "gcc" as a bare
-        // positional package name never starts with a hyphen, so neither
-        // should trip `-[A-Za-z]*c`.
+        // Substring safety (round 2, widened round 3): the
+        // clustered-short-option pattern must not deny a legitimate flag
+        // or package name that merely contains the letter "c" without a
+        // leading hyphen driving it. `-y` (assumeyes) alone has no "c" in
+        // it, and "gcc" as a bare positional package name never starts
+        // with a hyphen, so neither should trip `-[A-Za-z0-9]*c`.
         assert!(matches!(
             engine.evaluate("dnf", &["install".into(), "-y".into(), "gcc".into()]),
             Decision::Allowed

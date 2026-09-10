@@ -221,6 +221,25 @@ const SYSTEMCTL_TARGET_LIFECYCLE: &str = concat!(
     r"|system-update-cleanup\.service)\b"
 );
 
+/// (issue #71) `rpm-ostree` accepts a `-r`/`--reboot` flag on `install`,
+/// `upgrade`, and `uninstall` that reboots the host immediately once the
+/// transaction completes (confirmed live via `rpm-ostree <subcommand>
+/// --help`; `status` has no such flag). `standard` tier's `rpm-ostree`
+/// allow matches the leading subcommand only and says nothing about the
+/// flags that follow it, so `rpm-ostree upgrade --reboot` is allowed
+/// today with no deny in the way, sidestepping `SYSTEMCTL_TARGET_LIFECYCLE`
+/// entirely since that deny is keyed to the `systemctl` command only.
+///
+/// Live-verified against real `rpm-ostree` on a current Fedora container:
+/// no abbreviation of `--reboot` is accepted (`--reb` is rejected as
+/// "Unknown option"), but clustered short options are accepted (`-rq`
+/// passes option parsing, matching `-r` and `-q` together), and no other
+/// short option under `install`/`upgrade`/`uninstall` begins with `r`, so
+/// a clustered-form-aware pattern cannot collide with any legitimate
+/// flag. Mirrors the deny-before-allow pattern already used for `dnf`
+/// and `systemctl` in this file.
+const RPM_OSTREE_REBOOT_FLAG: &str = r"(?:^|\s)(?:--reboot|-[A-Za-z]*r)";
+
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
 /// attacker-controlled repository for the duration of the transaction,
@@ -599,6 +618,11 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
             Some("^(install|remove|upgrade)"),
             "install, remove, or upgrade a package via dnf",
         ),
+        deny(
+            "rpm-ostree",
+            RPM_OSTREE_REBOOT_FLAG,
+            "reject -r/--reboot (incl. clustered), which reboots the host immediately on completion, bypassing the systemctl-specific reboot lockdown",
+        ),
         allow(
             "rpm-ostree",
             Some("^(install|upgrade|status|uninstall)"),
@@ -869,6 +893,45 @@ mod tests {
             ),
             Decision::Allowed
         ));
+    }
+
+    #[test]
+    fn standard_tier_denies_rpm_ostree_reboot_flag_including_clustered_forms() {
+        // (issue #71) Live-verified against real rpm-ostree: -r and --reboot
+        // both pass option parsing on install/upgrade/uninstall, and -r
+        // clusters with other short flags (e.g. -rq for --reboot --quiet).
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["upgrade".to_string(), "--reboot".to_string()],
+            vec!["upgrade".to_string(), "-r".to_string()],
+            vec!["upgrade".to_string(), "-rq".to_string()],
+            vec!["upgrade".to_string(), "-qr".to_string()],
+            vec!["install".to_string(), "-r".to_string(), "htop".to_string()],
+            vec!["uninstall".to_string(), "-r".to_string(), "htop".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("rpm-ostree", &args), Decision::Denied(_)),
+                "rpm-ostree {} should be denied under standard tier",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn standard_tier_still_allows_ordinary_rpm_ostree_operations_without_reboot() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["upgrade".to_string()],
+            vec!["install".to_string(), "htop".to_string()],
+            vec!["status".to_string()],
+            vec!["uninstall".to_string(), "htop".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("rpm-ostree", &args), Decision::Allowed),
+                "rpm-ostree {} should remain allowed under standard tier",
+                args.join(" ")
+            );
+        }
     }
 
     #[test]

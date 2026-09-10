@@ -907,7 +907,11 @@ mod tests {
             vec!["upgrade".to_string(), "-rq".to_string()],
             vec!["upgrade".to_string(), "-qr".to_string()],
             vec!["install".to_string(), "-r".to_string(), "htop".to_string()],
-            vec!["uninstall".to_string(), "-r".to_string(), "htop".to_string()],
+            vec![
+                "uninstall".to_string(),
+                "-r".to_string(),
+                "htop".to_string(),
+            ],
         ] {
             assert!(
                 matches!(engine.evaluate("rpm-ostree", &args), Decision::Denied(_)),

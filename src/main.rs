@@ -166,9 +166,21 @@ fn validate_custom_rules_precondition(
     if !matches!(tier, TierName::Safe | TierName::Standard) {
         return Ok(());
     }
+    // A rule is "unconditional" (and therefore unfiltered root code
+    // execution under this tier) if it has no arg_pattern at all, or if its
+    // arg_pattern is a catch-all regex that is satisfied by the empty string
+    // (e.g. ".*", "a*", "^", "$"). PolicyEngine::evaluate does an unanchored
+    // substring match, so any such pattern matches every possible joined
+    // argv string just as unconditionally as `None` does, closing issue #42.
     let unconditional_allows: Vec<&str> = custom_rules
         .iter()
-        .filter(|r| matches!(r.effect, policy::Effect::Allow) && r.arg_pattern.is_none())
+        .filter(|r| {
+            matches!(r.effect, policy::Effect::Allow)
+                && match &r.arg_pattern {
+                    None => true,
+                    Some(pattern) => pattern.is_match(""),
+                }
+        })
         .map(|r| r.command.as_str())
         .collect();
     if unconditional_allows.is_empty() {
@@ -484,6 +496,66 @@ mod tests {
             arg_pattern: Some(regex::Regex::new("^-c echo").unwrap()),
             effect: policy::Effect::Allow,
             description: "test: restricted bash allow".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn custom_rules_with_a_catch_all_regex_arg_pattern_requires_the_risk_flag() {
+        // Issue #42 bypass: a syntactically valid regex like ".*" is
+        // Some(_), not None, but it matches the empty string and every
+        // other possible joined argv string just as unconditionally as
+        // arg_pattern: None would.
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: Some(regex::Regex::new(".*").unwrap()),
+            effect: policy::Effect::Allow,
+            description: "test: catch-all bash allow via .*".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bash"));
+    }
+
+    #[test]
+    fn custom_rules_with_a_zero_width_anchor_arg_pattern_requires_the_risk_flag() {
+        // "^" and "$" match the empty string (and thus every string) just
+        // as trivially as ".*" does, and are not covered by simply
+        // rejecting empty/whitespace arg_pattern strings at config load.
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: Some(regex::Regex::new("^").unwrap()),
+            effect: policy::Effect::Allow,
+            description: "test: catch-all bash allow via ^".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bash"));
+    }
+
+    #[test]
+    fn custom_rules_with_a_required_non_empty_prefix_do_not_require_the_risk_flag() {
+        // A pattern requiring at least one literal, non-optional character
+        // cannot match the empty string, so it is a genuine restriction and
+        // stays exempt from the gate.
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: Some(regex::Regex::new("^-c ls").unwrap()),
+            effect: policy::Effect::Allow,
+            description: "test: restricted bash allow requiring a literal prefix".to_string(),
         }];
         let result = validate_custom_rules_precondition(
             &policy::tiers::TierName::Safe,

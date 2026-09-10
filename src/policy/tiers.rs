@@ -259,6 +259,21 @@ const JOURNALCTL_MUTATION_FLAGS: &str =
 /// match; `*`, `ssh?d` and `ssh[a-z]` all do.
 const JOURNALCTL_GLOB_UNIT_FLAGS: &str = r"(?:^|\s)(?:-u\s*|--unit(?:=|\s+))[^\s]*[*?\[][^\s]*";
 
+/// (issue #38) A bare `+` token is journalctl's disjunction operator
+/// between match expressions (journalctl(1), "Matches"). A query such as
+/// `journalctl -u sshd.service + PRIORITY=0 + PRIORITY=1 + ... +
+/// PRIORITY=7` carries a literal, glob-free unit scope (passing
+/// JOURNALCTL_GLOB_UNIT_FLAGS) and a real value for the unit-scope allow,
+/// but the `+` disjunction means the query returns every message OR'd
+/// across all the appended match expressions, in this example the whole
+/// journal at every priority level. This reopens exactly the whole-system
+/// exposure issue #26 was filed to close, by a route neither of #26's two
+/// fixes anticipated. The pattern matches a `+` that is its own
+/// whitespace-delimited token (never `+` embedded inside a larger value,
+/// e.g. a unit name containing a literal `+` character, which stays
+/// unaffected).
+const JOURNALCTL_PLUS_DISJUNCTION: &str = r"(?:^|\s)\+(?:\s|$)";
+
 /// `sar`'s `-o <file>` writes its binary sample data to an arbitrary
 /// path, an arbitrary-file-write primitive wrapped in a monitoring tool
 /// that is otherwise entirely read-only. Denied before the broad allow,
@@ -310,6 +325,11 @@ pub(crate) fn safe_rules() -> Vec<Rule> {
             "journalctl",
             JOURNALCTL_GLOB_UNIT_FLAGS,
             "reject a glob-valued -u/--unit (journalctl treats it as a pattern matching every unit, not a literal name)",
+        ),
+        deny(
+            "journalctl",
+            JOURNALCTL_PLUS_DISJUNCTION,
+            "reject a bare '+' disjunction token (ORs the unit scope with every other appended match expression, reopening an unscoped read)",
         ),
         // (issue #26) `safe` requires a unit scope for journalctl reads.
         // The old `allow("journalctl", None)` matched any argument list
@@ -770,6 +790,59 @@ mod tests {
                 &["-u".into(), "sshd.service".into(), "-u".into(), "*".into()]
             ),
             Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_journalctl_plus_disjunction_but_allows_a_literal_unit_scope() {
+        // (issue #38) The confirmed bypass: a real unit scope combined with a
+        // '+' disjunction against enumerated priorities, which OR-combines
+        // into an effectively unscoped, whole-journal read.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate(
+                "journalctl",
+                &[
+                    "-u".into(),
+                    "sshd.service".into(),
+                    "+".into(),
+                    "PRIORITY=0".into(),
+                    "+".into(),
+                    "PRIORITY=1".into(),
+                    "+".into(),
+                    "PRIORITY=7".into(),
+                ]
+            ),
+            Decision::Denied(_)
+        ));
+
+        // A minimal two-token form of the same bypass.
+        assert!(matches!(
+            engine.evaluate(
+                "journalctl",
+                &[
+                    "-u".into(),
+                    "sshd.service".into(),
+                    "+".into(),
+                    "PRIORITY=0".into()
+                ]
+            ),
+            Decision::Denied(_)
+        ));
+
+        // Regression: an ordinary unit-scoped read with no '+' anywhere must
+        // remain allowed, the whole point of the original #26 fix.
+        assert!(matches!(
+            engine.evaluate("journalctl", &["-u".into(), "sshd.service".into()]),
+            Decision::Allowed
+        ));
+
+        // A unit name that happens to contain a literal '+' character (not a
+        // standalone token) must not be denied: the deny is anchored to a
+        // whitespace-delimited '+' token, not a bare substring match.
+        assert!(matches!(
+            engine.evaluate("journalctl", &["-u".into(), "my+unit.service".into()]),
+            Decision::Allowed
         ));
     }
 

@@ -129,9 +129,13 @@ mod tests {
         // equivalents the original five-name list missed, the second
         // found that plain .service units with SuccessAction=
         // directives reach the same outcomes with no .target in argv at
-        // all), ahead of the existing systemctl start/stop/... allow. So
-        // standard adds six rules over safe, not five.
-        assert_eq!(added.len(), 6);
+        // all), ahead of the existing systemctl start/stop/... allow.
+        // (issue #71) it also adds a deny rejecting rpm-ostree's -r/
+        // --reboot flag (incl. clustered forms), ahead of the existing
+        // rpm-ostree install/upgrade/status/uninstall allow, closing a
+        // reboot route the systemctl-specific deny above does nothing to
+        // stop. So standard adds seven rules over safe, not six.
+        assert_eq!(added.len(), 7);
         assert!(added_descriptions.contains(
             "reject start/stop/restart/enable/disable against any .target unit, or against systemd's own shutdown-action service units (systemd-poweroff/-reboot/-halt/-kexec/-soft-reboot/-exit/-factory-reset-reboot.service, system-update-cleanup.service), all of which reboot, power off, halt, or otherwise terminate the host regardless of tier restrictions"
         ));
@@ -140,6 +144,9 @@ mod tests {
             "reject --nogpgcheck/--no-gpgchecks/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)"
         ));
         assert!(added_descriptions.contains("install, remove, or upgrade a package via dnf"));
+        assert!(added_descriptions.contains(
+            "reject -r/--reboot (incl. clustered), which reboots the host immediately on completion, bypassing the systemctl-specific reboot lockdown"
+        ));
         assert!(added_descriptions
             .contains("install, upgrade, check status, or uninstall a package via rpm-ostree"));
         assert!(added_descriptions.contains("read the system journal, unscoped"));

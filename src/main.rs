@@ -152,20 +152,32 @@ fn validate_developer_tier_precondition(
 /// takes, applied to the specific shape that defeats it: a deliberate
 /// flag, not a config-file edit alone, is required to accept the risk.
 ///
-/// Scoped to `safe`/`standard` only. Under `developer` tier, an
-/// unconditional custom allow for a command outside `ROOT_REQUIRED_TOOLS`
-/// already gets privilege-dropped by default (issue #27's fix), and
-/// `unrestricted` is already "allow everything" and already gated by its
-/// own check above this one.
+/// Scoped to `safe`/`standard` unconditionally, plus `developer` for the
+/// specific commands `developer` tier does not actually privilege-drop.
+/// Under `developer` tier, an unconditional custom allow for a command
+/// outside `ROOT_REQUIRED_TOOLS` gets privilege-dropped by default
+/// (issue #27's fix), so that shape is genuinely exempt. But
+/// `developer_tier_run_as` (`src/tools/mod.rs`) only drops privilege when
+/// the command is *outside* `ROOT_REQUIRED_TOOLS`: a custom allow for a
+/// command that IS in that list (`dnf`, `systemctl`, `journalctl`, and the
+/// rest of the fixed set those tools need root for) still runs as root
+/// under `developer` tier, with no privilege drop and, before this fix, no
+/// gate either, the same shape as #41's escalation chain minus the
+/// config-file step. `unrestricted` is already "allow everything" and
+/// already gated by its own check above this one.
 fn validate_custom_rules_precondition(
     tier: &policy::tiers::TierName,
     custom_rules: &[policy::Rule],
     i_understand_the_risk: bool,
 ) -> anyhow::Result<()> {
-    use policy::tiers::TierName;
-    if !matches!(tier, TierName::Safe | TierName::Standard) {
-        return Ok(());
-    }
+    use policy::tiers::{TierName, ROOT_REQUIRED_TOOLS};
+    let gate_applies = match tier {
+        TierName::Safe | TierName::Standard => true,
+        // Under `developer`, only a `ROOT_REQUIRED_TOOLS` command is
+        // ungated: everything else already gets privilege-dropped.
+        TierName::Developer => false,
+        TierName::Unrestricted => return Ok(()),
+    };
     // A rule is "unconditional" (and therefore unfiltered root code
     // execution under this tier) if it has no arg_pattern at all, or if its
     // arg_pattern is a catch-all regex that is satisfied by the empty string
@@ -180,28 +192,40 @@ fn validate_custom_rules_precondition(
                     None => true,
                     Some(pattern) => pattern.is_match(""),
                 }
+                && (gate_applies
+                    || (matches!(tier, TierName::Developer)
+                        && ROOT_REQUIRED_TOOLS.contains(&r.command.as_str())))
         })
         .map(|r| r.command.as_str())
         .collect();
     if unconditional_allows.is_empty() {
         return Ok(());
     }
+    let reason = if matches!(tier, TierName::Developer) {
+        "which is normally privilege-dropped to developer_user under this tier, \
+         but that drop only applies to commands outside ROOT_REQUIRED_TOOLS. \
+         The command(s) named above ARE in ROOT_REQUIRED_TOOLS, so this \
+         unconditional allow still runs as root, exactly as it would under \
+         'safe'/'standard'"
+    } else {
+        "which has no privilege-drop mechanism (that only exists under \
+         'developer' tier)"
+    };
     if !i_understand_the_risk {
         anyhow::bail!(
             "config's custom_rules unconditionally allow {} under the '{}' \
-             policy tier, which has no privilege-drop mechanism (that only \
-             exists under 'developer' tier). An unconditional allow for any \
-             command under this tier is unfiltered root code execution, \
-             regardless of the tier's own restrictions. Refusing to start \
-             without --i-understand-the-risk. This cannot be enabled by a \
-             config file edit alone.",
+             policy tier, {reason}. An unconditional allow for any command \
+             in this shape is unfiltered root code execution, regardless of \
+             the tier's own restrictions. Refusing to start without \
+             --i-understand-the-risk. This cannot be enabled by a config \
+             file edit alone.",
             unconditional_allows.join(", "),
             policy::tiers::tier_display_name(tier)
         );
     }
     eprintln!(
         "WARNING: custom_rules unconditionally allow {} under the '{}' \
-         policy tier, which is unfiltered root code execution for those \
+         policy tier, {reason}, unfiltered root code execution for those \
          commands regardless of the tier's own restrictions.",
         unconditional_allows.join(", "),
         policy::tiers::tier_display_name(tier)
@@ -581,6 +605,37 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn custom_rules_unconditional_allow_of_a_root_required_tool_under_developer_tier_requires_the_risk_flag(
+    ) {
+        // (issue #42 reopen / #27's scoping hole) `dnf` is in
+        // ROOT_REQUIRED_TOOLS, so `developer_tier_run_as` does NOT
+        // privilege-drop it, unlike `perl` in the sibling test above. An
+        // unconditional custom allow for it under `developer` tier is
+        // therefore unfiltered root code execution, the same shape #42
+        // closed for `safe`/`standard`, and must require the flag too.
+        let custom_rules = vec![policy::Rule {
+            command: "dnf".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: unconditional dnf allow".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Developer,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dnf"));
+
+        let result_with_flag = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Developer,
+            &custom_rules,
+            true,
+        );
+        assert!(result_with_flag.is_ok());
     }
 
     #[test]

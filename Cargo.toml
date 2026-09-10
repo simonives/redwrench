@@ -1,6 +1,6 @@
 [package]
 name = "redwrench"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A security-conscious MCP server exposing Fedora hardware and OS control to AI coding agents"
@@ -46,3 +46,19 @@ clap_mangen = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Read by `cargo generate-rpm` in release.yml to build a .rpm asset for
+# GitHub Releases. This is not a rust2rpm-style .spec (see
+# packaging/redwrench.spec's own header for why that one isn't trusted
+# yet, its %cargo_build/%cargo_install macros need a real Fedora
+# mock/COPR build environment this CI container doesn't provide), just a
+# straightforward binary + man page + systemd unit package.
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/redwrench", dest = "/usr/bin/redwrench", mode = "0755" },
+    # release.yml copies the build-hash-suffixed man page build.rs
+    # generates to this stable path before this runs, the same way it
+    # already does for the tarball.
+    { source = "dist/redwrench.1", dest = "/usr/share/man/man1/redwrench.1", mode = "0644", doc = false },
+    { source = "packaging/redwrench.service", dest = "/usr/lib/systemd/system/redwrench.service", mode = "0644" },
+]

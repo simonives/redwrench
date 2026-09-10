@@ -50,6 +50,7 @@ Coverage and completeness work on an already-functional system, no new capabilit
 - [#67](https://github.com/simonives/redwrench/issues/67): test coverage for an unknown top-level `config.toml` field
 - [#68](https://github.com/simonives/redwrench/issues/68): evaluate `ProtectSystem=full`/`PrivateTmp=yes` for the systemd unit
 - [#69](https://github.com/simonives/redwrench/issues/69): post-install reminder to set a bearer token
+- [#70](https://github.com/simonives/redwrench/issues/70): README doesn't explain how to connect a client (Claude Code, Codex, Antigravity) once RedWrench is running
 
 ### v1.2, packaging and distribution
 

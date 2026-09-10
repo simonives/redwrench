@@ -150,6 +150,20 @@ const PING_ABUSE_FLAGS: &str = concat!(
 /// same letters.
 const SYSTEMCTL_HOST_REDIRECT_FLAGS: &str = r"(?:^|\s)--(?:ho|mac|ro|im)|(?:^|\s)-[A-Za-z]*[HM]";
 
+/// (issue #40) `systemctl start` (and `restart`) against these five target
+/// names reboots, powers off, halts, or drops the host to single-user
+/// (`rescue.target`) or minimal (`emergency.target`) mode. Each is
+/// ordinary service-lifecycle syntax naming a target instead of a
+/// service, so it matches `standard` tier's `^(start|stop|restart|...)`
+/// allow with no other change to the argument shape. `systemctl kill` and
+/// `systemctl isolate` were already excluded from the verb list, this
+/// closes the equivalent outcomes reachable via `start`/`restart`
+/// instead. Anchored to `\.target\b` so a real service unit whose name
+/// merely contains one of these words as a substring (unlikely, but not
+/// impossible) is unaffected.
+const SYSTEMCTL_DANGEROUS_TARGETS: &str =
+    r"(?:^|\s)(?:reboot|poweroff|halt|emergency|rescue)\.target\b";
+
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
 /// attacker-controlled repository for the duration of the transaction, and
@@ -435,6 +449,11 @@ pub(crate) fn safe_rules() -> Vec<Rule> {
 pub(crate) fn standard_rules() -> Vec<Rule> {
     let mut rules = safe_rules();
     rules.extend(vec![
+        deny(
+            "systemctl",
+            SYSTEMCTL_DANGEROUS_TARGETS,
+            "reject start/restart against reboot/poweroff/halt/emergency/rescue targets (reboots, powers off, halts, or drops to single-user mode)",
+        ),
         allow(
             "systemctl",
             Some("^(start|stop|restart|enable|disable)"),
@@ -612,6 +631,39 @@ mod tests {
         ));
         assert!(matches!(
             engine.evaluate("dnf", &["install".into(), "-y".into(), "htop".into()]),
+            Decision::Allowed
+        ));
+    }
+
+    #[test]
+    fn standard_tier_denies_reboot_and_halt_targets_but_allows_ordinary_service_control() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+
+        // (issue #40) Each of the five confirmed targets, via start.
+        for target in ["reboot", "poweroff", "halt", "emergency", "rescue"] {
+            let args = vec!["start".to_string(), format!("{target}.target")];
+            assert!(
+                matches!(engine.evaluate("systemctl", &args), Decision::Denied(_)),
+                "systemctl start {target}.target should be denied under standard tier"
+            );
+            // restart reaches the same outcomes and must be denied too.
+            let restart_args = vec!["restart".to_string(), format!("{target}.target")];
+            assert!(
+                matches!(
+                    engine.evaluate("systemctl", &restart_args),
+                    Decision::Denied(_)
+                ),
+                "systemctl restart {target}.target should be denied under standard tier"
+            );
+        }
+
+        // Regression: ordinary service control remains allowed.
+        assert!(matches!(
+            engine.evaluate("systemctl", &["start".into(), "sshd".into()]),
+            Decision::Allowed
+        ));
+        assert!(matches!(
+            engine.evaluate("systemctl", &["stop".into(), "sshd".into()]),
             Decision::Allowed
         ));
     }

@@ -120,10 +120,16 @@ mod tests {
         let added = additional_rules(&safe, &standard);
         let added_descriptions: std::collections::HashSet<&str> =
             added.iter().map(|r| r.description.as_str()).collect();
-        // (issue #26) standard_rules() now also restores the unscoped
-        // journalctl read safe_rules() no longer allows, so standard adds
-        // five rules over safe, not four.
-        assert_eq!(added.len(), 5);
+        // (issue #26) standard_rules() also restores the unscoped
+        // journalctl read safe_rules() no longer allows. (issue #40) it
+        // further adds a deny rejecting systemctl start/restart against
+        // reboot/poweroff/halt/emergency/rescue targets, ahead of the
+        // existing systemctl start/stop/... allow. So standard adds six
+        // rules over safe, not five.
+        assert_eq!(added.len(), 6);
+        assert!(added_descriptions.contains(
+            "reject start/restart against reboot/poweroff/halt/emergency/rescue targets (reboots, powers off, halts, or drops to single-user mode)"
+        ));
         assert!(added_descriptions.contains("start, stop, restart, enable, or disable a unit"));
         assert!(added_descriptions.contains(
             "reject --nogpgcheck/--repofrompath/--setopt (bypasses package signature and repository trust)"

@@ -139,6 +139,22 @@ arg_pattern = "^remove"
 effect = "deny"
 ```
 
+**An unconditional custom allow (`arg_pattern` omitted) is unfiltered root
+code execution for that command, and as of this patch the server refuses
+to start on one without an explicit override.** Under `safe`/`standard`
+tier, an unconditional allow for any command bypasses every restriction
+those tiers exist to enforce, since neither tier has a privilege-drop
+mechanism at all. Under `developer` tier, the same is true specifically
+for a command in `ROOT_REQUIRED_TOOLS` (`dnf`, `systemctl`, `journalctl`,
+and the rest of the fixed set those tools need root for): everything else
+under `developer` gets privilege-dropped to `developer_user` by default,
+but a `ROOT_REQUIRED_TOOLS` command does not, so an unconditional allow
+for one still runs as root there too. In either case the server refuses
+to start unless you pass `--i-understand-the-risk`. If you are upgrading
+from `v1.0.0` and your config has an unconditional `custom_rules` allow
+in one of these shapes, the server will refuse to start until you either
+add an `arg_pattern` restriction or pass the flag.
+
 Generate the token, then start the server:
 
 ```sh
@@ -152,8 +168,8 @@ it, so you narrow or widen any tier without editing the binary.
 
 | Tier | What it permits |
 | --- | --- |
-| `safe` | Read-only diagnostics: `systemctl status`/`is-active`/`is-enabled`, `journalctl` reads, `ping`, `ip` show/list/get. No mutation of system state. Journal-writing flags, flood/abuse ping flags (`-f`, `-A`, `-l`, `-s`, zero intervals), and systemctl flags that redirect the operation off this machine (`--host`/`-H`, `--machine`/`-M`, `--root`) are explicitly denied. |
-| `standard` | Everything in `safe`, plus service start/stop/restart/enable/disable and `dnf`/`rpm-ostree` install/remove/upgrade. Flags that defeat package signature checking (`--nogpgcheck`, `--repofrompath`, `--setopt`) are explicitly denied, including the abbreviated forms dnf's argparse CLI accepts. |
+| `safe` | Read-only diagnostics: `systemctl status`/`is-active`/`is-enabled`, `journalctl` reads, `ping`, `ip` show/list/get. No mutation of system state. Journal-writing flags, flood/abuse ping flags (`-f`, `-A`, `-l`, `-s`, zero intervals), and systemctl flags that redirect the operation off this machine (`--host`/`-H`, `--machine`/`-M`, `--root`) are explicitly denied, as are a bare `+` disjunction and `top -c` (full command-line disclosure). |
+| `standard` | Everything in `safe`, plus service start/stop/restart/enable/disable and `dnf`/`rpm-ostree` install/remove/upgrade. Flags that defeat package signature checking (`--nogpgcheck`, `--no-gpgchecks`, `--repofrompath`, `--setopt`) are explicitly denied, including the abbreviated forms dnf's argparse CLI accepts. Any `.target` unit is denied under these verbs (not just a named few), since service management means services, not targets, and so are systemd's own shutdown-action service units (`systemd-poweroff.service` and its `-reboot`/`-halt`/`-kexec`/`-soft-reboot`/`-exit`/`-factory-reset-reboot` siblings, plus `system-update-cleanup.service`), which reach the same reboot/power-off/halt outcomes as a `.target` with no `.target` in their name at all. |
 | `developer` | Everything in `standard`, plus `bash`, `sh`, `python3`, `gcc`, `cc`, `node`, `npm`, `cargo`, and `make`, unconditionally (no argument restriction). These run under a configured `developer_user` account instead of root, not RedWrench's own filtering, that account's own Unix permissions are what bound the risk. Requires `developer_user` to be set in `config.toml`; the server refuses to start under this tier without it. |
 | `unrestricted` | Everything, including unfiltered raw command execution. No policy restrictions at all. |
 

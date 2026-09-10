@@ -120,13 +120,24 @@ mod tests {
         let added = additional_rules(&safe, &standard);
         let added_descriptions: std::collections::HashSet<&str> =
             added.iter().map(|r| r.description.as_str()).collect();
-        // (issue #26) standard_rules() now also restores the unscoped
-        // journalctl read safe_rules() no longer allows, so standard adds
-        // five rules over safe, not four.
-        assert_eq!(added.len(), 5);
+        // (issue #26) standard_rules() also restores the unscoped
+        // journalctl read safe_rules() no longer allows. (issue #40) it
+        // further adds a deny rejecting systemctl lifecycle verbs against
+        // any .target unit or against systemd's own shutdown-action
+        // service units (a structural fix, not a hardcoded name list,
+        // after two reopens: one found eight more shipped .target
+        // equivalents the original five-name list missed, the second
+        // found that plain .service units with SuccessAction=
+        // directives reach the same outcomes with no .target in argv at
+        // all), ahead of the existing systemctl start/stop/... allow. So
+        // standard adds six rules over safe, not five.
+        assert_eq!(added.len(), 6);
+        assert!(added_descriptions.contains(
+            "reject start/stop/restart/enable/disable against any .target unit, or against systemd's own shutdown-action service units (systemd-poweroff/-reboot/-halt/-kexec/-soft-reboot/-exit/-factory-reset-reboot.service, system-update-cleanup.service), all of which reboot, power off, halt, or otherwise terminate the host regardless of tier restrictions"
+        ));
         assert!(added_descriptions.contains("start, stop, restart, enable, or disable a unit"));
         assert!(added_descriptions.contains(
-            "reject --nogpgcheck/--repofrompath/--setopt (bypasses package signature and repository trust)"
+            "reject --nogpgcheck/--no-gpgchecks/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)"
         ));
         assert!(added_descriptions.contains("install, remove, or upgrade a package via dnf"));
         assert!(added_descriptions

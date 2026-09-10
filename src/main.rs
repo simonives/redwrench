@@ -141,6 +141,98 @@ fn validate_developer_tier_precondition(
     Ok(Some(identity))
 }
 
+/// (issue #42) `custom_rules` are prepended ahead of every tier rule
+/// (`Config::effective_rules`), so an unconditional allow
+/// (`arg_pattern: None`) for any command under `safe` or `standard`
+/// tier is unfiltered root code execution: those two tiers have no
+/// privilege-drop mechanism at all (that only exists under `developer`,
+/// see `RedWrenchServer::developer_tier_run_as`), and the server
+/// continues to report its active tier as `safe`/`standard` with no
+/// warning. This is the same posture `unrestricted` tier's own gate
+/// takes, applied to the specific shape that defeats it: a deliberate
+/// flag, not a config-file edit alone, is required to accept the risk.
+///
+/// Scoped to `safe`/`standard` unconditionally, plus `developer` for the
+/// specific commands `developer` tier does not actually privilege-drop.
+/// Under `developer` tier, an unconditional custom allow for a command
+/// outside `ROOT_REQUIRED_TOOLS` gets privilege-dropped by default
+/// (issue #27's fix), so that shape is genuinely exempt. But
+/// `developer_tier_run_as` (`src/tools/mod.rs`) only drops privilege when
+/// the command is *outside* `ROOT_REQUIRED_TOOLS`: a custom allow for a
+/// command that IS in that list (`dnf`, `systemctl`, `journalctl`, and the
+/// rest of the fixed set those tools need root for) still runs as root
+/// under `developer` tier, with no privilege drop and, before this fix, no
+/// gate either, the same shape as #41's escalation chain minus the
+/// config-file step. `unrestricted` is already "allow everything" and
+/// already gated by its own check above this one.
+fn validate_custom_rules_precondition(
+    tier: &policy::tiers::TierName,
+    custom_rules: &[policy::Rule],
+    i_understand_the_risk: bool,
+) -> anyhow::Result<()> {
+    use policy::tiers::{TierName, ROOT_REQUIRED_TOOLS};
+    let gate_applies = match tier {
+        TierName::Safe | TierName::Standard => true,
+        // Under `developer`, only a `ROOT_REQUIRED_TOOLS` command is
+        // ungated: everything else already gets privilege-dropped.
+        TierName::Developer => false,
+        TierName::Unrestricted => return Ok(()),
+    };
+    // A rule is "unconditional" (and therefore unfiltered root code
+    // execution under this tier) if it has no arg_pattern at all, or if its
+    // arg_pattern is a catch-all regex that is satisfied by the empty string
+    // (e.g. ".*", "a*", "^", "$"). PolicyEngine::evaluate does an unanchored
+    // substring match, so any such pattern matches every possible joined
+    // argv string just as unconditionally as `None` does, closing issue #42.
+    let unconditional_allows: Vec<&str> = custom_rules
+        .iter()
+        .filter(|r| {
+            matches!(r.effect, policy::Effect::Allow)
+                && match &r.arg_pattern {
+                    None => true,
+                    Some(pattern) => pattern.is_match(""),
+                }
+                && (gate_applies
+                    || (matches!(tier, TierName::Developer)
+                        && ROOT_REQUIRED_TOOLS.contains(&r.command.as_str())))
+        })
+        .map(|r| r.command.as_str())
+        .collect();
+    if unconditional_allows.is_empty() {
+        return Ok(());
+    }
+    let reason = if matches!(tier, TierName::Developer) {
+        "which is normally privilege-dropped to developer_user under this tier, \
+         but that drop only applies to commands outside ROOT_REQUIRED_TOOLS. \
+         The command(s) named above ARE in ROOT_REQUIRED_TOOLS, so this \
+         unconditional allow still runs as root, exactly as it would under \
+         'safe'/'standard'"
+    } else {
+        "which has no privilege-drop mechanism (that only exists under \
+         'developer' tier)"
+    };
+    if !i_understand_the_risk {
+        anyhow::bail!(
+            "config's custom_rules unconditionally allow {} under the '{}' \
+             policy tier, {reason}. An unconditional allow for any command \
+             in this shape is unfiltered root code execution, regardless of \
+             the tier's own restrictions. Refusing to start without \
+             --i-understand-the-risk. This cannot be enabled by a config \
+             file edit alone.",
+            unconditional_allows.join(", "),
+            policy::tiers::tier_display_name(tier)
+        );
+    }
+    eprintln!(
+        "WARNING: custom_rules unconditionally allow {} under the '{}' \
+         policy tier, {reason}, unfiltered root code execution for those \
+         commands regardless of the tier's own restrictions.",
+        unconditional_allows.join(", "),
+        policy::tiers::tier_display_name(tier)
+    );
+    Ok(())
+}
+
 async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     // NOTE (post-review fix, audit must not fail silently): if journald is
     // unavailable (containers, non-systemd hosts), `audit::init_logging`
@@ -179,6 +271,12 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
              All commands will be allowed with no policy restrictions."
         );
     }
+
+    validate_custom_rules_precondition(
+        &config.tier,
+        &config.custom_rules,
+        cli.i_understand_the_risk,
+    )?;
 
     let developer_identity =
         validate_developer_tier_precondition(&config.tier, &config.developer_user)?;
@@ -383,5 +481,176 @@ mod tests {
             let result = validate_developer_tier_precondition(&tier, &None);
             assert_eq!(result.unwrap(), None);
         }
+    }
+
+    #[test]
+    fn custom_rules_unconditional_allow_under_safe_tier_requires_the_risk_flag() {
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: unconditional bash allow".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bash"));
+    }
+
+    #[test]
+    fn custom_rules_unconditional_allow_under_safe_tier_succeeds_with_the_risk_flag() {
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: unconditional bash allow".to_string(),
+        }];
+        let result =
+            validate_custom_rules_precondition(&policy::tiers::TierName::Safe, &custom_rules, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn custom_rules_with_an_argument_restriction_do_not_require_the_risk_flag() {
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: Some(regex::Regex::new("^-c echo").unwrap()),
+            effect: policy::Effect::Allow,
+            description: "test: restricted bash allow".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn custom_rules_with_a_catch_all_regex_arg_pattern_requires_the_risk_flag() {
+        // Issue #42 bypass: a syntactically valid regex like ".*" is
+        // Some(_), not None, but it matches the empty string and every
+        // other possible joined argv string just as unconditionally as
+        // arg_pattern: None would.
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: Some(regex::Regex::new(".*").unwrap()),
+            effect: policy::Effect::Allow,
+            description: "test: catch-all bash allow via .*".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bash"));
+    }
+
+    #[test]
+    fn custom_rules_with_a_zero_width_anchor_arg_pattern_requires_the_risk_flag() {
+        // "^" and "$" match the empty string (and thus every string) just
+        // as trivially as ".*" does, and are not covered by simply
+        // rejecting empty/whitespace arg_pattern strings at config load.
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: Some(regex::Regex::new("^").unwrap()),
+            effect: policy::Effect::Allow,
+            description: "test: catch-all bash allow via ^".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bash"));
+    }
+
+    #[test]
+    fn custom_rules_with_a_required_non_empty_prefix_do_not_require_the_risk_flag() {
+        // A pattern requiring at least one literal, non-optional character
+        // cannot match the empty string, so it is a genuine restriction and
+        // stays exempt from the gate.
+        let custom_rules = vec![policy::Rule {
+            command: "bash".to_string(),
+            arg_pattern: Some(regex::Regex::new("^-c ls").unwrap()),
+            effect: policy::Effect::Allow,
+            description: "test: restricted bash allow requiring a literal prefix".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn custom_rules_unconditional_allow_under_developer_tier_does_not_require_the_risk_flag() {
+        // (issue #27) already gets privilege-dropped by default under
+        // developer tier, so this specific gate does not need to fire there.
+        let custom_rules = vec![policy::Rule {
+            command: "perl".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: unconditional perl allow".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Developer,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn custom_rules_unconditional_allow_of_a_root_required_tool_under_developer_tier_requires_the_risk_flag(
+    ) {
+        // (issue #42 reopen / #27's scoping hole) `dnf` is in
+        // ROOT_REQUIRED_TOOLS, so `developer_tier_run_as` does NOT
+        // privilege-drop it, unlike `perl` in the sibling test above. An
+        // unconditional custom allow for it under `developer` tier is
+        // therefore unfiltered root code execution, the same shape #42
+        // closed for `safe`/`standard`, and must require the flag too.
+        let custom_rules = vec![policy::Rule {
+            command: "dnf".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: unconditional dnf allow".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Developer,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dnf"));
+
+        let result_with_flag = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Developer,
+            &custom_rules,
+            true,
+        );
+        assert!(result_with_flag.is_ok());
+    }
+
+    #[test]
+    fn custom_rules_unconditional_deny_does_not_require_the_risk_flag() {
+        let custom_rules = vec![policy::Rule {
+            command: "rm".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Deny,
+            description: "test: unconditional rm deny".to_string(),
+        }];
+        let result = validate_custom_rules_precondition(
+            &policy::tiers::TierName::Safe,
+            &custom_rules,
+            false,
+        );
+        assert!(result.is_ok());
     }
 }

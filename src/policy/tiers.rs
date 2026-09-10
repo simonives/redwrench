@@ -449,6 +449,53 @@ pub const DEVELOPER_TOOLS: &[&str] = &[
     "bash", "sh", "python3", "gcc", "cc", "node", "npm", "cargo", "make",
 ];
 
+/// (issue #27) Commands that must keep running as root regardless of the
+/// active tier, even under `developer`. These are exactly the commands
+/// `safe`/`standard` define: `systemctl`, `journalctl`, `ping`, and `ip`
+/// (from `safe_rules()`), plus `vmstat`, `sar`, and `top` (the monitoring
+/// allowances also in `safe_rules()`), plus `dnf` and `rpm-ostree` (added
+/// by `standard_rules()`). Every one of these needs real system privilege
+/// to do anything useful (querying/controlling systemd units, installing
+/// packages, reading protected log sources, opening raw sockets for ICMP),
+/// so dropping privilege for them would just make them fail, not make them
+/// safer.
+///
+/// `dispatch()`'s privilege-drop decision under `developer` tier is gated
+/// against this list, not against `DEVELOPER_TOOLS`: the original gating
+/// (`run_as` applied only when the command is in `DEVELOPER_TOOLS`) meant a
+/// `custom_rules` allow entry for any command outside that fixed list
+/// (e.g. `perl`, `ruby`, or a broad wildcard) was policy-allowed under
+/// `developer` tier but ran as root, since nothing checked "the active
+/// tier is `developer` and this command isn't one of the small set that
+/// legitimately needs root." Gating on this list instead means an operator
+/// adding a `custom_rules` allow for an interpreter-shaped binary
+/// `DEVELOPER_TOOLS` never anticipated defaults to a dropped privilege,
+/// the safe failure mode, rather than defaulting to root.
+///
+/// Hand-maintained, same as `tier_order()` and `rules_for_tier`'s match
+/// arm: needs updating if `safe_rules()`/`standard_rules()` ever define a
+/// new command that genuinely requires root.
+///
+/// Matching is by exact command string, the same way `PolicyEngine`
+/// itself matches. A path form of one of these commands (e.g.
+/// `/usr/bin/systemctl`, reachable only via a `custom_rules` wildcard
+/// allow, since every built-in tier rule and structured tool passes a
+/// bare literal) will not match this list and will be privilege-dropped
+/// instead of running as root. This fails toward less privilege, not
+/// more, so it is a functionality gap for that one operator
+/// configuration, not a security one.
+pub const ROOT_REQUIRED_TOOLS: &[&str] = &[
+    "systemctl",
+    "journalctl",
+    "ping",
+    "ip",
+    "vmstat",
+    "sar",
+    "top",
+    "dnf",
+    "rpm-ostree",
+];
+
 fn developer_rules() -> Vec<Rule> {
     let mut rules = standard_rules();
     rules.extend(DEVELOPER_TOOLS.iter().map(|tool| {

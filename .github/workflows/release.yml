@@ -43,10 +43,18 @@ jobs:
           cp "$man_page" dist/redwrench.1
           tar -C dist -czf "redwrench-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" redwrench redwrench.1
 
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Build the RPM package
+        run: cargo generate-rpm
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          files: redwrench-*-x86_64-linux.tar.gz
+          files: |
+            redwrench-*-x86_64-linux.tar.gz
+            target/generate-rpm/*.rpm
           generate_release_notes: true
           # v0.x tags are pre-1.0, marked as such on the release page rather
           # than silently implying a stability guarantee this project isn't

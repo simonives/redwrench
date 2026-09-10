@@ -1,4 +1,7 @@
 /target
 
+# release.yml's scratch directory for staging the tarball/RPM's contents
+/dist
+
 # Transient review report, not a repo artefact
 /adversarial-fix-report.md

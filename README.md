@@ -1,7 +1,10 @@
 # RedWrench
 
 [![CI](https://github.com/simonives/redwrench/actions/workflows/ci.yml/badge.svg)](https://github.com/simonives/redwrench/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/simonives/redwrench)](https://github.com/simonives/redwrench/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
+See [CHANGELOG.md](CHANGELOG.md) for what shipped in each release, and [ROADMAP.md](ROADMAP.md) for what's planned next and why.
 
 I keep a few old machines at home running Fedora, and the hardware's
 too outdated to sell but still fine as a home server or something to
@@ -60,10 +63,15 @@ corrupt memory outside its own transaction.
 
 ## Install
 
-RedWrench is not packaged yet. `packaging/redwrench.spec` is a
-work-in-progress RPM spec (see its own header for the `rust2rpm`
-regeneration it still needs), so for now build from source on the Fedora
-machine RedWrench will control:
+**From a release (recommended).** Every [tagged release](https://github.com/simonives/redwrench/releases) ships an `.rpm` alongside a plain tarball, built on and for Fedora. Download the `.rpm` from the latest release's assets and install it:
+
+```sh
+sudo dnf install ./redwrench-*.rpm
+```
+
+This installs the binary and its man page (`man redwrench`) and the systemd unit at `packaging/redwrench.service`. It is not yet in a COPR repository or Fedora's official repos, see [ROADMAP.md](ROADMAP.md) for that. `packaging/redwrench.spec` is a separate, work-in-progress rust2rpm-style spec for that future COPR submission, not what builds the release `.rpm` today, see its own header for why it isn't trusted yet.
+
+**From source**, if you'd rather build it yourself:
 
 ```sh
 sudo dnf install -y cargo rust systemd-devel gcc pkgconf-pkg-config

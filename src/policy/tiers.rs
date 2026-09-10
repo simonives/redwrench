@@ -166,35 +166,44 @@ const SYSTEMCTL_DANGEROUS_TARGETS: &str =
 
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
-/// attacker-controlled repository for the duration of the transaction, and
-/// `--setopt` can reach either of those (and more) indirectly. The tier's
-/// `^(install|remove|upgrade)` allow pattern matches the leading subcommand
-/// only and says nothing about the flags that follow it.
+/// attacker-controlled repository for the duration of the transaction,
+/// `--setopt` can reach either of those (and more) indirectly, and
+/// `-c`/`--config` (issue #41) achieves both `--nogpgcheck` and
+/// `--repofrompath` at once via an alternate config file, since dnf reads
+/// `gpgcheck`/repository declarations from whatever config it's pointed
+/// at, not only `/etc/dnf/dnf.conf`. `--installroot` is the same
+/// "operate against a different filesystem tree" concern
+/// `SYSTEMCTL_HOST_REDIRECT_FLAGS`'s `--root` already closes for
+/// systemctl. `--destdir`/`--downloaddir` write caller-chosen files to a
+/// caller-chosen path as root. The tier's `^(install|remove|upgrade)`
+/// allow pattern matches the leading subcommand only and says nothing
+/// about the flags that follow it.
 ///
-/// The patterns match *prefixes*, not the full flag names. dnf's CLI is
-/// argparse-based with `allow_abbrev` left at its default, so any
-/// unambiguous prefix of a long option is accepted: `dnf install
-/// --nogpgchec pkg` disables signature checking exactly as `--nogpgcheck`
-/// does, while containing neither the substring `nogpgcheck` nor anything
-/// the old pattern matched. Each prefix below is the shortest form that is
-/// still unambiguous to dnf itself, so every abbreviation dnf would accept
-/// necessarily contains it:
-/// * `--nog` — the other `--no*` options are `--nobest`, `--nodocs`,
+/// The patterns match *prefixes*, not the full flag names, for the same
+/// `allow_abbrev`-driven reason the original three alternatives do (dnf's
+/// CLI is argparse-based with unambiguous-prefix abbreviation on by
+/// default):
+/// * `--nog`: the other `--no*` options are `--nobest`, `--nodocs`,
 ///   `--noautoremove` and `--noplugins`, so `--nog` already resolves
 ///   uniquely to `--nogpgcheck`.
-/// * `--repof` — `--repo` is itself a real option, so the shortest
+/// * `--repof`: `--repo` is itself a real option, so the shortest
 ///   unambiguous prefix of `--repofrompath` is one character longer.
-/// * `--set` — no other dnf option begins `--set`.
+/// * `--set`: no other dnf option begins `--set`.
+/// * `-c`/`--conf`: dnf has no other `-c` short option, and `--config`
+///   is the only long option beginning `--conf`.
+/// * `--installroot`: no other dnf option shares this prefix at any
+///   useful abbreviation length, matched in full since a short prefix
+///   here would risk matching an unrelated future option too eagerly.
+/// * `--destdir`/`--downloaddir`: matched in full for the same reason.
 ///
-/// Requiring the leading `--` keeps these short prefixes from matching a
-/// package name that merely happens to contain the same letters. The whole
-/// alternation is anchored to a `(?:^|\s)` token boundary before the `--`,
-/// the same style `SYSTEMCTL_HOST_REDIRECT_FLAGS` uses, so a package name or
-/// argument value that merely *contains* one of these substrings mid-word
-/// (rather than being the flag itself) is not denied, e.g. an argument
-/// containing the literal text `offset` no longer trips the `--set`
-/// fragment.
-const DNF_TRUST_BYPASS_FLAGS: &str = r"(?:^|\s)--(?:nog|repof|set)";
+/// Requiring the leading `--`/`-` keeps these short prefixes from
+/// matching a package name that merely happens to contain the same
+/// letters. The whole alternation is anchored to a `(?:^|\s)` token
+/// boundary, the same style `SYSTEMCTL_HOST_REDIRECT_FLAGS` uses, so a
+/// package name or argument value that merely *contains* one of these
+/// substrings mid-word is not denied.
+const DNF_TRUST_BYPASS_FLAGS: &str =
+    r"(?:^|\s)(?:--nog|--repof|--set|-c\b|--conf|--installroot|--destdir|--downloaddir)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -462,7 +471,7 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
         deny(
             "dnf",
             DNF_TRUST_BYPASS_FLAGS,
-            "reject --nogpgcheck/--repofrompath/--setopt (bypasses package signature and repository trust)",
+            "reject --nogpgcheck/--repofrompath/--setopt/-c/--config/--installroot/--destdir/--downloaddir (bypasses package signature and repository trust, or operates against a different filesystem tree)",
         ),
         allow(
             "dnf",
@@ -1469,6 +1478,61 @@ mod tests {
                 &["install".into(), "--nogpgcheck".into(), "foo".into()]
             ),
             Decision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn standard_tier_denies_dnf_alternate_config_and_installroot_bypasses() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+
+        // (issue #41) The confirmed bypass: an alternate config achieves
+        // --nogpgcheck + --repofrompath together with no denied flag.
+        for args in [
+            vec![
+                "install".to_string(),
+                "-c".to_string(),
+                "/tmp/evil.conf".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--config".to_string(),
+                "/tmp/evil.conf".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--installroot=/mnt/other".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--destdir=/tmp/evil".to_string(),
+                "pkg".to_string(),
+            ],
+            vec![
+                "install".to_string(),
+                "--downloaddir=/tmp/evil".to_string(),
+                "pkg".to_string(),
+            ],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &args), Decision::Denied(_)),
+                "dnf {args:?} should be denied under standard tier"
+            );
+        }
+
+        // Regression: an ordinary install remains allowed.
+        assert!(matches!(
+            engine.evaluate("dnf", &["install".into(), "htop".into()]),
+            Decision::Allowed
+        ));
+
+        // Substring safety: a package name merely containing "config" or
+        // "installroot" as a substring, not as the flag itself, stays allowed.
+        assert!(matches!(
+            engine.evaluate("dnf", &["install".into(), "myconfigtool".into()]),
+            Decision::Allowed
         ));
     }
 

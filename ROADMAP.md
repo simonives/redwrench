@@ -22,7 +22,7 @@ Found by an independent tier-charter audit ([docs/superpowers/specs/2026-09-10-t
 
 ### v1.1, policy engine polish
 
-Coverage and completeness work on an already-functional system, no new capability, closing gaps. Extended with the tier-charter audit's remaining findings (medium and low severity, plus documentation drift), alongside the pre-existing polish items, and with the surviving findings from an independent cross-model review (#65-#69, an external agy/GPT-OSS pass over the whole repo; most of that pass's higher-severity security claims didn't survive verification against the actual code and aren't included, only the test-coverage and packaging gaps that checked out).
+Coverage and completeness work on an already-functional system, no new capability, closing gaps. Extended with the tier-charter audit's remaining findings (medium and low severity, plus documentation drift), alongside the pre-existing polish items, and with the surviving findings from two independent cross-model reviews: #65-#69 (agy/GPT-OSS 120B; most of that pass's higher-severity security claims didn't survive verification against the actual code and aren't included, only the test-coverage and packaging gaps that checked out) and #71-#75 (agy/Gemini 3.1 Pro High, a repeat pass on the same repo with a stronger model; all 5 findings survived independent verification against the real source, a meaningfully cleaner result, including two genuine previously-unflagged security gaps, #71 and #72).
 
 - [#22](https://github.com/simonives/redwrench/issues/22): hardware inventory commands (`lscpu`, `uname`, `free`, `lsblk`, `df`) added to `safe` tier
 - [#25](https://github.com/simonives/redwrench/issues/25): `run_command` shouldn't silently block for the full timeout on an unbounded command when no streaming client is attached
@@ -51,6 +51,11 @@ Coverage and completeness work on an already-functional system, no new capabilit
 - [#68](https://github.com/simonives/redwrench/issues/68): evaluate `ProtectSystem=full`/`PrivateTmp=yes` for the systemd unit
 - [#69](https://github.com/simonives/redwrench/issues/69): post-install reminder to set a bearer token
 - [#70](https://github.com/simonives/redwrench/issues/70): README doesn't explain how to connect a client (Claude Code, Codex, Antigravity) once RedWrench is running
+- [#71](https://github.com/simonives/redwrench/issues/71): `rpm-ostree --reboot` bypasses the systemctl reboot lockdown
+- [#72](https://github.com/simonives/redwrench/issues/72): developer-tier privilege drop leaks root's full environment to the child process
+- [#73](https://github.com/simonives/redwrench/issues/73): package-upgrade self-restart can SIGKILL an in-flight dnf/rpm-ostree transaction
+- [#74](https://github.com/simonives/redwrench/issues/74): streamed progress notifications corrupt multi-byte UTF-8 split across chunk boundaries
+- [#75](https://github.com/simonives/redwrench/issues/75): `run_command` has no `--` separator, injection defence rests entirely on `tiers.rs` regexes (discipline note, not currently exploitable)
 
 ### v1.2, packaging and distribution
 

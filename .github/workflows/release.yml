@@ -44,7 +44,7 @@ jobs:
           tar -C dist -czf "redwrench-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" redwrench redwrench.1
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: redwrench-*-x86_64-linux.tar.gz
           generate_release_notes: true

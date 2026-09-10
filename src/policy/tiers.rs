@@ -475,6 +475,15 @@ pub const DEVELOPER_TOOLS: &[&str] = &[
 /// Hand-maintained, same as `tier_order()` and `rules_for_tier`'s match
 /// arm: needs updating if `safe_rules()`/`standard_rules()` ever define a
 /// new command that genuinely requires root.
+///
+/// Matching is by exact command string, the same way `PolicyEngine`
+/// itself matches. A path form of one of these commands (e.g.
+/// `/usr/bin/systemctl`, reachable only via a `custom_rules` wildcard
+/// allow, since every built-in tier rule and structured tool passes a
+/// bare literal) will not match this list and will be privilege-dropped
+/// instead of running as root. This fails toward less privilege, not
+/// more, so it is a functionality gap for that one operator
+/// configuration, not a security one.
 pub const ROOT_REQUIRED_TOOLS: &[&str] = &[
     "systemctl",
     "journalctl",

@@ -525,12 +525,13 @@ pub(crate) mod tests {
         // systemctl under the developer tier must behave exactly as it does
         // under standard: root, unaffected by developer_identity being set.
         // `systemctl status` is allowed under developer (inherited from
-        // standard/safe) but `systemctl` is not in DEVELOPER_TOOLS, so this
-        // call must not have privilege dropped. This test confirms the call
-        // reaches the executor at all (is not denied by policy), it cannot
-        // itself observe "ran as root" without a real systemctl target on the
-        // test machine, that is what the run_as_drops_privilege tests in
-        // executor.rs already cover for the mechanism itself.
+        // standard/safe) and `systemctl` is in ROOT_REQUIRED_TOOLS (issue
+        // #27), so this call must not have privilege dropped. This test
+        // confirms the call reaches the executor at all (is not denied by
+        // policy); `developer_tier_run_as_keeps_every_root_required_tool_as_root`
+        // covers the actual gating decision directly, and the
+        // run_as_drops_privilege tests in executor.rs cover the privilege-drop
+        // mechanism itself.
         let server =
             developer_tier_server(Duration::from_secs(5), developer_identity_for("nobody"));
         let (ctx, _guard) = test_request_context(&server);

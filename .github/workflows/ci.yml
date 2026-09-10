@@ -18,7 +18,7 @@ jobs:
     container:
       image: fedora:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: dnf install -y cargo rust rustfmt clippy systemd-devel gcc pkgconf-pkg-config

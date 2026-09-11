@@ -2262,7 +2262,10 @@ mod tests {
         let engine = PolicyEngine::new(rules);
         assert!(
             matches!(
-                engine.evaluate("dnf", &["install".into(), "--nogpgcheck".into(), "htop".into()]),
+                engine.evaluate(
+                    "dnf",
+                    &["install".into(), "--nogpgcheck".into(), "htop".into()]
+                ),
                 Decision::Denied(_)
             ),
             "a hypothetical safe-tier dnf allow must not make DNF_TRUST_BYPASS_FLAGS unreachable"

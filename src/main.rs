@@ -141,6 +141,58 @@ fn validate_developer_tier_precondition(
     Ok(Some(identity))
 }
 
+/// (issue #54) `validate_developer_tier_precondition` only checks that
+/// `developer_user` resolves to a non-root uid. It says nothing about
+/// whether that account can `sudo` back to root, which would defeat the
+/// entire tier: any dropped command could trivially re-escalate via
+/// `sudo`, since `sudo` itself is not denied by the policy engine and
+/// would run under the dropped identity's own sudo rights.
+///
+/// Group-based sudoers rules (`%wheel`) are incidentally neutralised
+/// already, `setgroups(&[])` in `executor.rs`'s privilege drop clears all
+/// supplementary groups including `wheel` membership, but that is
+/// incidental protection, not a designed one, and does not cover a
+/// user-named `NOPASSWD` entry (e.g. `developer_user ALL=(ALL) NOPASSWD:
+/// ALL`).
+///
+/// Root can query any user's sudo rights without a password prompt via
+/// `sudo -l -U <username>` (confirmed live: exits 0 either way, the
+/// distinguishing signal is in the output text, not the exit code).
+/// `sudo -l -U <user>` prints "is not allowed to run sudo" when the user
+/// has no sudo rights at all, and something else (naming the permitted
+/// commands) otherwise. This is a warning, not a hard refusal: unlike
+/// `unrestricted` tier or the `custom_rules` unconditional-allow gate,
+/// this is an operator misconfiguration an agent cannot trigger
+/// remotely, not a reachable-by-an-agent bypass, so refusing to start
+/// over it would be a surprising failure mode for an operator who has a
+/// deliberate, unrelated reason to grant that account some sudo rights.
+///
+/// If `sudo` itself is not installed (or otherwise fails to spawn), the
+/// check is skipped silently rather than failing startup over a missing
+/// optional binary, the same "do not add a new failure mode over an
+/// environment gap" posture `audit::init_logging`'s journald fallback
+/// already takes in `run_server`.
+fn warn_on_developer_user_sudo_access(username: &str) {
+    let output = match std::process::Command::new("sudo")
+        .args(["-l", "-U", username])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("is not allowed to run sudo") {
+        eprintln!(
+            "WARNING: developer_user '{username}' has sudo access. Any command \
+             dropped to this account under 'developer' tier can potentially \
+             re-escalate to root via sudo, defeating the tier's privilege-drop \
+             guarantee. Review this account's sudoers configuration if this is \
+             unintentional. ('sudo -l -U {username}' reported: {})",
+            stdout.trim()
+        );
+    }
+}
+
 /// (issue #42) `custom_rules` are prepended ahead of every tier rule
 /// (`Config::effective_rules`), so an unconditional allow
 /// (`arg_pattern: None`) for any command under `safe` or `standard`
@@ -280,6 +332,9 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
 
     let developer_identity =
         validate_developer_tier_precondition(&config.tier, &config.developer_user)?;
+    if let Some(ref username) = config.developer_user {
+        warn_on_developer_user_sudo_access(username);
+    }
 
     let tier_name = policy::tiers::tier_display_name(&config.tier);
     let server = RedWrenchServer::new(
@@ -355,6 +410,7 @@ fn allowed_hosts_for(bind_address: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn allowed_hosts_includes_loopback_and_the_configured_bind_address() {
@@ -652,5 +708,43 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn warn_on_developer_user_sudo_access_does_not_panic_for_a_real_unprivileged_user() {
+        // (issue #54) "nobody" exists on every Fedora system (this project's
+        // documented test environment) and has no sudoers entry by default.
+        // This is a smoke test confirming the function runs to completion
+        // without panicking; the actual warning text goes to stderr, which
+        // Rust's test harness does not capture for inline assertion, so this
+        // test cannot assert on the warning's absence directly, only that
+        // calling the function is safe.
+        warn_on_developer_user_sudo_access("nobody");
+    }
+
+    #[test]
+    fn warn_on_developer_user_sudo_access_does_not_panic_when_sudo_reports_a_nopasswd_entry() {
+        // (issue #54) Creates a real, temporary sudoers.d entry for a
+        // throwaway account, confirms the function runs to completion, then
+        // cleans up. This project's existing tests already require a real
+        // Fedora environment running as root (see `identity_for` in
+        // executor.rs), so creating a real sudoers file here is consistent
+        // with that established practice, not a new requirement.
+        let sudoers_path = "/etc/sudoers.d/redwrench-test-nopasswd";
+        std::fs::write(
+            sudoers_path,
+            "nobody ALL=(ALL) NOPASSWD: ALL\n",
+        )
+        .expect("this test requires root, matching this project's other Fedora-only tests");
+        // sudoers.d files must be mode 0440 or sudo ignores them with a
+        // warning rather than an error, which would make this test silently
+        // meaningless rather than fail loudly.
+        std::fs::set_permissions(
+            sudoers_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o440),
+        )
+        .unwrap();
+        warn_on_developer_user_sudo_access("nobody");
+        std::fs::remove_file(sudoers_path).ok();
     }
 }

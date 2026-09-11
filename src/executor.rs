@@ -256,11 +256,14 @@ pub async fn execute(
         // developer tier is meant to provide. `env_clear()` first, then
         // reconstruct a minimal, known-safe environment for the dropped
         // identity: HOME/USER/LOGNAME (the account's own identity) plus a
-        // standard PATH (matching a typical non-root Fedora account, no
-        // sbin directories since an unprivileged account has no business
-        // needing them) and TERM (some tools misbehave with no TERM set
-        // at all; "xterm" is a safe, widely-supported default for
-        // non-interactive use).
+        // fixed, explicit PATH and TERM (some tools misbehave with no TERM
+        // set at all; "xterm" is a safe, widely-supported default for
+        // non-interactive use). The privilege boundary here is the uid
+        // drop itself, not the PATH; the PATH is fixed purely so it can
+        // never be influenced by whatever the parent process happened to
+        // inherit, not because any directory on a real Fedora PATH would
+        // grant escalation (Fedora merged /usr/sbin into /usr/bin, so
+        // there is no separate sbin tier to exclude here).
         cmd.env_clear()
             .current_dir(home)
             .env("HOME", home)
@@ -478,6 +481,16 @@ mod tests {
             Some(identity),
         )
         .await;
+        // The command must actually have run. A failed spawn also yields
+        // empty stdout, which would satisfy the assertion below for the
+        // wrong reason, exactly the way the sibling privilege-drop tests in
+        // this file already guard against a silently-vacuous pass.
+        assert_eq!(
+            result.exit_code,
+            Some(1),
+            "privilege-dropped spawn did not run: {:?}",
+            result.stderr
+        );
         // printenv exits non-zero and prints nothing when the variable is unset.
         assert!(
             result.stdout.trim().is_empty(),
@@ -504,9 +517,17 @@ mod tests {
         assert!(result.stdout.contains(&format!("HOME={}", home.display())));
         assert!(result.stdout.contains(&format!("USER={name}")));
         assert!(result.stdout.contains(&format!("LOGNAME={name}")));
+        // Pinned to the exact value, not just "PATH=" is present: a leaked
+        // inherited PATH would satisfy a bare substring check just as well
+        // as the explicit one this fix sets, defeating the point of the test.
         assert!(
-            result.stdout.contains("PATH="),
-            "child must have a usable PATH set explicitly, not inherited: {:?}",
+            result.stdout.contains("PATH=/usr/local/bin:/usr/bin:/bin"),
+            "child must have the fixed, explicit PATH this fix sets, not an inherited one: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("TERM=xterm"),
+            "child must have TERM set explicitly: {:?}",
             result.stdout
         );
     }

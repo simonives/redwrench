@@ -1921,7 +1921,11 @@ mod tests {
             vec!["install".to_string(), "./evil.rpm".to_string()],
             vec!["install".to_string(), "../evil.rpm".to_string()],
             vec!["install".to_string(), "evil.rpm".to_string()],
-            vec!["install".to_string(), "-y".to_string(), "/tmp/evil.rpm".to_string()],
+            vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "/tmp/evil.rpm".to_string(),
+            ],
         ] {
             assert!(
                 matches!(engine.evaluate("dnf", &args), Decision::Denied(_)),
@@ -1936,7 +1940,11 @@ mod tests {
         let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
         for args in [
             vec!["install".to_string(), "htop".to_string()],
-            vec!["install".to_string(), "-y".to_string(), "python3-flask".to_string()],
+            vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "python3-flask".to_string(),
+            ],
             vec!["install".to_string(), "rpmlint".to_string()],
             vec!["remove".to_string(), "htop".to_string()],
             vec!["upgrade".to_string()],

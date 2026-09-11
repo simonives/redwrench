@@ -345,6 +345,26 @@ const RPM_OSTREE_REBOOT_FLAG: &str = r"(?:^|\s)(?:--reboot|-[A-Za-z]*r)";
 const DNF_TRUST_BYPASS_FLAGS: &str =
     r"(?:^|\s)(?:--nog|--no-g|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z0-9]*c)";
 
+/// (issue #48) `dnf install /path/to/local.rpm` matches `standard` tier's
+/// `^(install|remove|upgrade)` allow with no denied flag involved at all,
+/// since there's no flag, just a path where a repository package name is
+/// expected. `dnf`'s `localpkg_gpgcheck` setting controls whether a
+/// locally-supplied RPM file gets signature-checked before its scriptlets
+/// run as root, independently of `gpgcheck` (repository packages).
+///
+/// Live-verified on a current Fedora container (dnf5 5.4.3.0, Fedora's
+/// current default `dnf`): `gpgcheck = 1` but `localpkg_gpgcheck = 0`, so
+/// a local RPM file is installed with no signature check at all today, on
+/// this project's own default deployment target.
+///
+/// Matches an argument that looks like a filesystem path (starts with
+/// `/`, `./`, or `../`) or a `.rpm` filename (ends in `.rpm`), rather
+/// than an ordinary repository package name, which never takes either
+/// shape in practice. `\S*\.rpm` requires the literal substring `.rpm`,
+/// so it does not false-positive on a package merely containing the
+/// letters "rpm" with no preceding dot (e.g. `rpmlint`).
+const DNF_LOCAL_PACKAGE_PATH: &str = r"(?:^|\s)(?:\.{0,2}/\S*|\S*\.rpm)(?:\s|$)";
+
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
 /// Secure Sealing keys, so it belongs with the vacuum/rotate family even
@@ -611,6 +631,11 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
             "dnf",
             DNF_TRUST_BYPASS_FLAGS,
             "reject --nogpgcheck/--no-gpgchecks/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)",
+        ),
+        deny(
+            "dnf",
+            DNF_LOCAL_PACKAGE_PATH,
+            "reject a filesystem path or .rpm filename as the package argument (local RPM installs bypass signature verification, since localpkg_gpgcheck defaults to false and is independent of gpgcheck)",
         ),
         allow(
             "dnf",
@@ -1883,6 +1908,45 @@ mod tests {
             engine.evaluate("dnf", &["install".into(), "-y".into(), "gcc".into()]),
             Decision::Allowed
         ));
+    }
+
+    #[test]
+    fn standard_tier_denies_dnf_install_of_a_local_rpm_path_or_filename() {
+        // (issue #48) localpkg_gpgcheck defaults to false on both dnf4 and
+        // dnf5 (live-confirmed on dnf5 5.4.3.0, Fedora's current default), so
+        // a local RPM install bypasses signature verification entirely.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["install".to_string(), "/tmp/evil.rpm".to_string()],
+            vec!["install".to_string(), "./evil.rpm".to_string()],
+            vec!["install".to_string(), "../evil.rpm".to_string()],
+            vec!["install".to_string(), "evil.rpm".to_string()],
+            vec!["install".to_string(), "-y".to_string(), "/tmp/evil.rpm".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &args), Decision::Denied(_)),
+                "dnf {} should be denied under standard tier",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn standard_tier_still_allows_ordinary_dnf_package_names() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["install".to_string(), "htop".to_string()],
+            vec!["install".to_string(), "-y".to_string(), "python3-flask".to_string()],
+            vec!["install".to_string(), "rpmlint".to_string()],
+            vec!["remove".to_string(), "htop".to_string()],
+            vec!["upgrade".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &args), Decision::Allowed),
+                "dnf {} should remain allowed under standard tier",
+                args.join(" ")
+            );
+        }
     }
 
     #[test]

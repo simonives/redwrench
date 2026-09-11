@@ -285,6 +285,60 @@ fn validate_custom_rules_precondition(
     Ok(())
 }
 
+/// (issue #58) `Config::effective_rules` prepends `custom_rules` ahead of
+/// every tier rule, correct and deliberate for custom denies, but for a
+/// custom allow it means the tier's own deny for that command becomes
+/// unreachable, first-match-wins, whenever the custom allow's pattern
+/// matches. An operator writing an unconditional custom allow for a
+/// command that also has a tier-level deny is very likely doing this
+/// unintentionally, e.g. "allow ping" reasonably means "let the agent
+/// ping normally", not "reinstate every abuse flag the tier denies".
+///
+/// Detection mirrors #42's "unconditional" check (no `arg_pattern`, or a
+/// catch-all pattern satisfied by the empty string): scan the active
+/// tier's own rule list (`rules_for_tier`) for any `Deny` rule on the
+/// same command. If one exists, the custom allow shadows it. This is a
+/// warning, not a hard refusal (unlike #42's gate): the operator has
+/// explicitly authored this allow, it is a config-review nudge, not a
+/// concealed root-execution primitive.
+fn custom_allow_shadowed_tier_denies(
+    tier: &policy::tiers::TierName,
+    custom_rules: &[policy::Rule],
+) -> Vec<String> {
+    let tier_rules = policy::tiers::rules_for_tier(tier);
+    let mut warnings = Vec::new();
+    for rule in custom_rules {
+        if !matches!(rule.effect, policy::Effect::Allow) {
+            continue;
+        }
+        let is_unconditional = match &rule.arg_pattern {
+            None => true,
+            Some(pattern) => pattern.is_match(""),
+        };
+        if !is_unconditional {
+            continue;
+        }
+        let shadowed: Vec<&str> = tier_rules
+            .iter()
+            .filter(|r| r.command == rule.command && matches!(r.effect, policy::Effect::Deny))
+            .map(|r| r.description.as_str())
+            .collect();
+        if !shadowed.is_empty() {
+            warnings.push(format!(
+                "custom_rules unconditionally allow '{}', which reinstates behaviour \
+                 the '{}' tier otherwise denies for that command: {}. Since \
+                 custom_rules are evaluated before tier rules, this custom allow \
+                 makes those denials unreachable for '{}'.",
+                rule.command,
+                policy::tiers::tier_display_name(tier),
+                shadowed.join("; "),
+                rule.command
+            ));
+        }
+    }
+    warnings
+}
+
 async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     // NOTE (post-review fix, audit must not fail silently): if journald is
     // unavailable (containers, non-systemd hosts), `audit::init_logging`
@@ -329,6 +383,10 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         &config.custom_rules,
         cli.i_understand_the_risk,
     )?;
+
+    for warning in custom_allow_shadowed_tier_denies(&config.tier, &config.custom_rules) {
+        eprintln!("WARNING: {warning}");
+    }
 
     let developer_identity =
         validate_developer_tier_precondition(&config.tier, &config.developer_user)?;
@@ -742,5 +800,54 @@ mod tests {
         .unwrap();
         warn_on_developer_user_sudo_access("nobody");
         std::fs::remove_file(sudoers_path).ok();
+    }
+
+    #[test]
+    fn custom_unconditional_ping_allow_at_safe_tier_warns_about_the_shadowed_abuse_flag_deny() {
+        // (issue #58) safe tier has PING_ABUSE_FLAGS denies for "ping". A
+        // custom unconditional allow for "ping" sits ahead of those denies
+        // (custom_rules are prepended, see Config::effective_rules), making
+        // them unreachable for that command.
+        let custom_rules = vec![policy::Rule {
+            command: "ping".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: allow ping".to_string(),
+        }];
+        let warnings =
+            custom_allow_shadowed_tier_denies(&policy::tiers::TierName::Safe, &custom_rules);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ping"));
+    }
+
+    #[test]
+    fn custom_allow_for_a_command_with_no_tier_level_deny_produces_no_warning() {
+        // (issue #58) "ip" has no deny rule at safe tier at all, only an
+        // allow, so there is nothing for a custom allow to shadow.
+        let custom_rules = vec![policy::Rule {
+            command: "ip".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: allow ip".to_string(),
+        }];
+        let warnings =
+            custom_allow_shadowed_tier_denies(&policy::tiers::TierName::Safe, &custom_rules);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn custom_deny_does_not_trigger_a_shadowed_tier_deny_warning() {
+        // A custom deny for a command with an existing tier deny is not the
+        // shape issue #58 describes (it reinforces the tier's own posture,
+        // it does not reopen anything), so it must not warn.
+        let custom_rules = vec![policy::Rule {
+            command: "ping".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Deny,
+            description: "test: deny ping entirely".to_string(),
+        }];
+        let warnings =
+            custom_allow_shadowed_tier_denies(&policy::tiers::TierName::Safe, &custom_rules);
+        assert!(warnings.is_empty());
     }
 }

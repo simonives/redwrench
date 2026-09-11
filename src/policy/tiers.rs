@@ -342,6 +342,17 @@ const RPM_OSTREE_REBOOT_FLAG: &str = r"(?:^|\s)(?:--reboot|-[A-Za-z]*r)";
 /// substrings mid-word, or a positional argument that merely contains
 /// the letter `c` without a leading hyphen (e.g. `myconfigtool`,
 /// `gcc-package`), is not denied.
+///
+/// (issue #51) This deny's correctness currently depends on an absence:
+/// `safe_rules()` defines no `dnf` allow at all, so nothing sits ahead of
+/// this deny in evaluation order. If `safe` ever gains a `dnf` allow (a
+/// reasonable future addition, e.g. a read-only `dnf list`), that allow
+/// would sit earlier in the rule list (since `standard_rules()` extends
+/// `safe_rules()`) and would make this deny unreachable, first-match-wins,
+/// for any argument string the new `safe` allow already matched. Check
+/// `dnf_trust_bypass_survives_a_hypothetical_safe_tier_dnf_allow` (in this
+/// file's test module) before adding any `safe`-tier `dnf` rule: it fails
+/// loudly the moment a `safe`-tier allow reopens this gap.
 const DNF_TRUST_BYPASS_FLAGS: &str =
     r"(?:^|\s)(?:--nog|--no-g|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z0-9]*c)";
 
@@ -2226,6 +2237,36 @@ mod tests {
             ),
             Decision::Denied(_)
         ));
+    }
+
+    #[ignore = "issue #51: demonstrates the fragility, not a bug in current shipped rules (safe has no real dnf allow yet); un-ignore and fix (e.g. duplicate the trust-bypass deny into safe_rules() itself, or move it, once a real safe-tier dnf allow is proposed)"]
+    #[test]
+    fn dnf_trust_bypass_survives_a_hypothetical_safe_tier_dnf_allow() {
+        // (issue #51) safe_rules() currently has no "dnf" allow at all, which
+        // is the only reason standard's DNF_TRUST_BYPASS_FLAGS deny is
+        // reachable. This test constructs the scenario issue #51 warns
+        // about directly: an engine built from safe_rules() plus a
+        // hypothetical unconditional "dnf" allow prepended ahead of
+        // standard's own rules (mirroring how a real safe-tier addition
+        // would sit earlier in evaluation order), and asserts the
+        // trust-bypass deny still applies. If this test starts failing, it
+        // means a real safe-tier dnf allow was added without addressing
+        // issue #51's structural fragility, and this deny needs to move (or
+        // be duplicated) ahead of that allow, not just live in standard.
+        let mut rules = vec![super::allow(
+            "dnf",
+            None,
+            "hypothetical future safe-tier dnf allow, for regression testing only",
+        )];
+        rules.extend(standard_rules());
+        let engine = PolicyEngine::new(rules);
+        assert!(
+            matches!(
+                engine.evaluate("dnf", &["install".into(), "--nogpgcheck".into(), "htop".into()]),
+                Decision::Denied(_)
+            ),
+            "a hypothetical safe-tier dnf allow must not make DNF_TRUST_BYPASS_FLAGS unreachable"
+        );
     }
 
     #[test]

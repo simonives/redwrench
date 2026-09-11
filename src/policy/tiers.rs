@@ -693,15 +693,34 @@ pub const DEVELOPER_TOOLS: &[&str] = &[
 ];
 
 /// (issue #27) Commands that must keep running as root regardless of the
-/// active tier, even under `developer`. These are exactly the commands
-/// `safe`/`standard` define: `systemctl`, `journalctl`, `ping`, and `ip`
-/// (from `safe_rules()`), plus `vmstat`, `sar`, and `top` (the monitoring
-/// allowances also in `safe_rules()`), plus `dnf` and `rpm-ostree` (added
-/// by `standard_rules()`). Every one of these needs real system privilege
-/// to do anything useful (querying/controlling systemd units, installing
-/// packages, reading protected log sources, opening raw sockets for ICMP),
-/// so dropping privilege for them would just make them fail, not make them
-/// safer.
+/// active tier, even under `developer`.
+///
+/// (issue #52) `vmstat`, `sar`, `top`, and `ping` were removed from this
+/// list after live verification found all four work fine unprivileged on
+/// a default Fedora system: `vmstat`/`sar`/`top` read world-readable
+/// `/proc` and `/var/log/sa` data, and `ping` uses an unprivileged ICMP
+/// socket under Fedora's default `net.ipv4.ping_group_range` (confirmed
+/// `0 2147483647`, permitting every group). Keeping them here was
+/// unnecessary privilege under `developer` tier for no functional gain,
+/// and it specifically made issue #39's `top -c` disclosure worse than it
+/// needed to be, since `top` running as root discloses more than `top`
+/// running unprivileged would (the underlying `/proc/*/cmdline` exposure
+/// is world-readable regardless, so #39's fix stands either way).
+///
+/// The remaining commands are exactly the commands `safe`/`standard`
+/// define: `systemctl` and `journalctl` (from `safe_rules()`), plus `ip`
+/// (also in `safe_rules()`), plus `dnf` and `rpm-ostree` (added by
+/// `standard_rules()`). Every one of these needs real system privilege to
+/// do anything useful (querying/controlling systemd units, installing
+/// packages, reading the journal via supplementary group membership that
+/// gets cleared by the privilege drop's `setgroups(&[])` call, managing
+/// network interfaces, and package installation). Dropping privilege for
+/// them would just make them fail, not make them safer.
+///
+/// `journalctl` stays: `systemd-journal` group membership would suffice
+/// in principle, but the privilege drop's `setgroups(&[])` call clears
+/// all supplementary groups, so the group route is not actually available
+/// even though it otherwise would be.
 ///
 /// `dispatch()`'s privilege-drop decision under `developer` tier is gated
 /// against this list, not against `DEVELOPER_TOOLS`: the original gating
@@ -727,17 +746,7 @@ pub const DEVELOPER_TOOLS: &[&str] = &[
 /// instead of running as root. This fails toward less privilege, not
 /// more, so it is a functionality gap for that one operator
 /// configuration, not a security one.
-pub const ROOT_REQUIRED_TOOLS: &[&str] = &[
-    "systemctl",
-    "journalctl",
-    "ping",
-    "ip",
-    "vmstat",
-    "sar",
-    "top",
-    "dnf",
-    "rpm-ostree",
-];
+pub const ROOT_REQUIRED_TOOLS: &[&str] = &["systemctl", "journalctl", "ip", "dnf", "rpm-ostree"];
 
 fn developer_rules() -> Vec<Rule> {
     let mut rules = standard_rules();
@@ -2217,5 +2226,24 @@ mod tests {
             ),
             Decision::Denied(_)
         ));
+    }
+
+    #[test]
+    fn root_required_tools_no_longer_includes_vmstat_sar_top_or_ping() {
+        // (issue #52) Live-verified all four work fine unprivileged on a
+        // default Fedora system; keeping them root-required was unnecessary
+        // privilege under developer tier for no functional gain.
+        for tool in ["vmstat", "sar", "top", "ping"] {
+            assert!(
+                !ROOT_REQUIRED_TOOLS.contains(&tool),
+                "{tool} should no longer be in ROOT_REQUIRED_TOOLS"
+            );
+        }
+        for tool in ["systemctl", "journalctl", "ip", "dnf", "rpm-ostree"] {
+            assert!(
+                ROOT_REQUIRED_TOOLS.contains(&tool),
+                "{tool} must remain in ROOT_REQUIRED_TOOLS"
+            );
+        }
     }
 }

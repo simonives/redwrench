@@ -410,7 +410,6 @@ fn allowed_hosts_for(bind_address: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn allowed_hosts_includes_loopback_and_the_configured_bind_address() {

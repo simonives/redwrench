@@ -437,23 +437,22 @@ const JOURNALCTL_GLOB_UNIT_FLAGS: &str = r"(?:^|\s)(?:-u\s*|--unit(?:=|\s+))[^\s
 /// unaffected).
 const JOURNALCTL_PLUS_DISJUNCTION: &str = r"(?:^|\s)\+(?:\s|$)";
 
-/// `sar`'s `-o <file>` writes its binary sample data to an arbitrary
-/// path, an arbitrary-file-write primitive wrapped in a monitoring tool
-/// that is otherwise entirely read-only. Denied before the broad allow,
-/// same first-match-wins pattern as the other tier-level hardening in
-/// this file.
-///
-/// The pattern deliberately has no word boundary after `-o`: `sar` accepts
-/// the output path attached to the flag with no separator (`-ofile.dat`),
-/// the same clustered-short-option shape `PING_ABUSE_FLAGS` was hardened
-/// against for forms like `-fc100`. A trailing `\b` would only match the
-/// space-separated form (`-o /tmp/evil.dat`, where the boundary falls on
-/// the space) and miss the attached form entirely, since `o` and the
-/// following filename character are both word characters and no boundary
-/// exists between them. None of sar's other options begin with `o`
-/// (`-u`, `-r`, `-b`, `-d`, `-n`, `-S`, `-q`, `-w`), so matching bare `-o`
-/// regardless of what follows catches both forms without rejecting any
-/// legitimate flag.
+/// `sar`'s `-o` (write raw sample data to an arbitrary path) is denied
+/// unconditionally. `sar`'s own usage text lists `-o [ <filename> ]` as a
+/// standalone bracketed alternative, separate from the activity-letter
+/// group (`-A`, `-B`, `-b`, ..., `-u [ALL]`, ...), and this was live
+/// confirmed on real sysstat 12.7.9: `sar -uo <file> 1 1`, `sar -ou <file>
+/// 1 1`, and `sar -bo <file> 1 1` were all rejected outright by sar's own
+/// parser (usage error, no file created), so `-o` cannot cluster with any
+/// activity letter in either order (issue #46, ranked PLAUSIBLE by an
+/// earlier audit, REFUTED by this live test). Also live-verified: this
+/// version of sar does not accept an attached-form output path (`sar
+/// -oevil.dat 1 1` was rejected the same way as the clustered forms), it
+/// requires a space before the filename (`sar -o evil.dat 1 1`, which
+/// does work). The pattern has no trailing boundary regardless, since it
+/// matches "-o" as a substring preceded by whitespace or string-start no
+/// matter what follows, so it would already catch an attached form too if
+/// a different sysstat version ever accepted one.
 const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o";
 
 /// (issue #39) `top -c` switches to full command-line display. Since
@@ -2025,6 +2024,32 @@ mod tests {
         assert!(matches!(
             engine.evaluate("sar", &["-u".into(), "1".into(), "5".into()]),
             Decision::Allowed
+        ));
+    }
+
+    #[test]
+    fn safe_tier_denies_sar_o_flag_even_when_an_activity_letter_precedes_it_in_argv() {
+        // (issue #46, refuted live) sar's own parser rejects -o clustered
+        // with an activity letter, so this can never legitimately reach the
+        // policy engine as a single clustered token in the first place. This
+        // test guards the policy engine's own behaviour regardless: even a
+        // hypothetical future sysstat version that did accept clustering
+        // would still be denied, since the regex matches "-o" as a substring
+        // with no requirement about what precedes or follows it in the same
+        // joined argument string.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate(
+                "sar",
+                &[
+                    "-u".into(),
+                    "-o".into(),
+                    "/tmp/evil.dat".into(),
+                    "1".into(),
+                    "5".into()
+                ]
+            ),
+            Decision::Denied(_)
         ));
     }
 

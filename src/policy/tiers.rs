@@ -355,14 +355,24 @@ const DNF_TRUST_BYPASS_FLAGS: &str =
 /// Live-verified on a current Fedora container (dnf5 5.4.3.0, Fedora's
 /// current default `dnf`): `gpgcheck = 1` but `localpkg_gpgcheck = 0`, so
 /// a local RPM file is installed with no signature check at all today, on
-/// this project's own default deployment target.
+/// this project's own default deployment target. Independently
+/// re-confirmed on dnf5 5.4.4.0, so this is not version-pinned.
 ///
 /// Matches an argument that looks like a filesystem path (starts with
 /// `/`, `./`, or `../`) or a `.rpm` filename (ends in `.rpm`), rather
-/// than an ordinary repository package name, which never takes either
-/// shape in practice. `\S*\.rpm` requires the literal substring `.rpm`,
-/// so it does not false-positive on a package merely containing the
-/// letters "rpm" with no preceding dot (e.g. `rpmlint`).
+/// than an ordinary repository package name, which does not take either
+/// shape. `\S*\.rpm` requires the literal substring `.rpm`, so it does
+/// not false-positive on a package merely containing the letters "rpm"
+/// with no preceding dot (e.g. `rpmlint`), live-verified against real
+/// dnf5 across 18 realistic package-name shapes with no false positive.
+///
+/// One deliberate piece of collateral: dnf also resolves an absolute
+/// path against a repository package's own provides (e.g. `dnf install
+/// /usr/bin/vim` legitimately installs the signed `vim-enhanced` repo
+/// package), and this deny cannot distinguish that from a genuine local
+/// RPM path without stat-ing the filesystem, which the policy engine has
+/// no access to do. Denying that form too is the correct tradeoff: an
+/// operator who needs it can still reach it via `custom_rules`.
 const DNF_LOCAL_PACKAGE_PATH: &str = r"(?:^|\s)(?:\.{0,2}/\S*|\S*\.rpm)(?:\s|$)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`

@@ -134,14 +134,22 @@ mod tests {
         // --reboot flag (incl. clustered forms), ahead of the existing
         // rpm-ostree install/upgrade/status/uninstall allow, closing a
         // reboot route the systemctl-specific deny above does nothing to
-        // stop. So standard adds seven rules over safe, not six.
-        assert_eq!(added.len(), 7);
+        // stop. (issue #48) it also adds a deny rejecting a filesystem
+        // path or .rpm filename as a dnf install argument, ahead of the
+        // existing dnf install/remove/upgrade allow, since a local RPM
+        // install bypasses signature verification entirely (dnf's
+        // localpkg_gpgcheck defaults to false, independent of gpgcheck).
+        // So standard adds eight rules over safe, not seven.
+        assert_eq!(added.len(), 8);
         assert!(added_descriptions.contains(
             "reject start/stop/restart/enable/disable against any .target unit, or against systemd's own shutdown-action service units (systemd-poweroff/-reboot/-halt/-kexec/-soft-reboot/-exit/-factory-reset-reboot.service, system-update-cleanup.service), all of which reboot, power off, halt, or otherwise terminate the host regardless of tier restrictions"
         ));
         assert!(added_descriptions.contains("start, stop, restart, enable, or disable a unit"));
         assert!(added_descriptions.contains(
             "reject --nogpgcheck/--no-gpgchecks/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)"
+        ));
+        assert!(added_descriptions.contains(
+            "reject a filesystem path or .rpm filename as the package argument (local RPM installs bypass signature verification, since localpkg_gpgcheck defaults to false and is independent of gpgcheck)"
         ));
         assert!(added_descriptions.contains("install, remove, or upgrade a package via dnf"));
         assert!(added_descriptions.contains(

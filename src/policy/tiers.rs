@@ -2290,4 +2290,36 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn run_command_shaped_calls_are_denied_by_tiers_rs_regexes_with_no_separator_injected() {
+        // (issue #75) run_command has no "--" separator injection, unlike
+        // dnf.rs/systemctl.rs/network.rs's dedicated routers. This test
+        // proves the invariant those routers' absence of a run_command-level
+        // guard depends on: tiers.rs's own deny regexes catch a dangerous
+        // flag even with no "--" separator anywhere in argv, for at least
+        // one dnf case and one systemctl case, the exact shape a run_command
+        // call would take. If a future change to either deny regex weakens
+        // it in a way that only the router's "--" injection was catching,
+        // this test fails, since it deliberately omits the separator a
+        // dedicated router would have added.
+        let standard = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        assert!(
+            matches!(
+                standard.evaluate("dnf", &["install".into(), "--nogpgcheck".into(), "htop".into()]),
+                Decision::Denied(_)
+            ),
+            "dnf --nogpgcheck must be denied even with no -- separator (run_command shape)"
+        );
+        assert!(
+            matches!(
+                standard.evaluate(
+                    "systemctl",
+                    &["start".into(), "reboot.target".into()]
+                ),
+                Decision::Denied(_)
+            ),
+            "systemctl start reboot.target must be denied even with no -- separator (run_command shape)"
+        );
+    }
 }

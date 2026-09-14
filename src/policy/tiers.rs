@@ -2306,7 +2306,10 @@ mod tests {
         let standard = PolicyEngine::new(rules_for_tier(&TierName::Standard));
         assert!(
             matches!(
-                standard.evaluate("dnf", &["install".into(), "--nogpgcheck".into(), "htop".into()]),
+                standard.evaluate(
+                    "dnf",
+                    &["install".into(), "--nogpgcheck".into(), "htop".into()]
+                ),
                 Decision::Denied(_)
             ),
             "dnf --nogpgcheck must be denied even with no -- separator (run_command shape)"

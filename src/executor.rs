@@ -246,10 +246,31 @@ pub async fn execute(
         // closure, and the drop below happens entirely inside that closure,
         // so the `chdir` still runs as root and cannot fail on a home
         // directory the account itself could not traverse.
-        cmd.current_dir(home)
+        //
+        // (issue #72) `.env(...)` alone only inserts/overrides individual
+        // keys into the *inherited* environment; it does not clear the
+        // rest. Since RedWrench itself runs as root, the privilege-dropped
+        // child previously inherited root's full environment (PATH, any
+        // LD_PRELOAD, XDG_RUNTIME_DIR=/run/user/0, anything else present
+        // in the service's environment), undermining the isolation
+        // developer tier is meant to provide. `env_clear()` first, then
+        // reconstruct a minimal, known-safe environment for the dropped
+        // identity: HOME/USER/LOGNAME (the account's own identity) plus a
+        // fixed, explicit PATH and TERM (some tools misbehave with no TERM
+        // set at all; "xterm" is a safe, widely-supported default for
+        // non-interactive use). The privilege boundary here is the uid
+        // drop itself, not the PATH; the PATH is fixed purely so it can
+        // never be influenced by whatever the parent process happened to
+        // inherit, not because any directory on a real Fedora PATH would
+        // grant escalation (Fedora merged /usr/sbin into /usr/bin, so
+        // there is no separate sbin tier to exclude here).
+        cmd.env_clear()
+            .current_dir(home)
             .env("HOME", home)
             .env("USER", name)
-            .env("LOGNAME", name);
+            .env("LOGNAME", name)
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("TERM", "xterm");
 
         // The whole privilege drop happens here in one `pre_exec` closure
         // rather than through `Command::uid`/`Command::gid`, because the
@@ -441,6 +462,74 @@ mod tests {
             name: user.name,
             home: user.dir,
         }
+    }
+
+    #[tokio::test]
+    async fn run_as_clears_the_parent_environment_before_spawning() {
+        // (issue #72) cargo sets several env vars at runtime when it invokes
+        // a test binary (CARGO_MANIFEST_DIR among them), a real, always-present
+        // parent-process env var we did not have to inject ourselves. If the
+        // developer-tier privilege drop clears the environment properly, the
+        // dropped child must not see it.
+        let identity = identity_for("nobody");
+        let result = execute(
+            "printenv",
+            &["CARGO_MANIFEST_DIR".to_string()],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some(identity),
+        )
+        .await;
+        // The command must actually have run. A failed spawn also yields
+        // empty stdout, which would satisfy the assertion below for the
+        // wrong reason, exactly the way the sibling privilege-drop tests in
+        // this file already guard against a silently-vacuous pass.
+        assert_eq!(
+            result.exit_code,
+            Some(1),
+            "privilege-dropped spawn did not run: {:?}",
+            result.stderr
+        );
+        // printenv exits non-zero and prints nothing when the variable is unset.
+        assert!(
+            result.stdout.trim().is_empty(),
+            "CARGO_MANIFEST_DIR leaked into the privilege-dropped child: {:?}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn run_as_still_gives_the_child_a_usable_minimal_environment() {
+        // (issue #72) Clearing the environment must not break HOME/USER/
+        // LOGNAME/PATH, the minimal set developer-tier tools actually need.
+        let identity = identity_for("nobody");
+        let (name, home) = (identity.name.clone(), identity.home.clone());
+        let result = execute(
+            "env",
+            &[],
+            Duration::from_secs(5),
+            None,
+            None,
+            Some(identity),
+        )
+        .await;
+        assert!(result.stdout.contains(&format!("HOME={}", home.display())));
+        assert!(result.stdout.contains(&format!("USER={name}")));
+        assert!(result.stdout.contains(&format!("LOGNAME={name}")));
+        // Pinned to the exact value, not just "PATH=" is present: a leaked
+        // inherited PATH would satisfy a bare substring check just as well
+        // as the explicit one this fix sets, defeating the point of the test.
+        assert!(
+            result.stdout.contains("PATH=/usr/local/bin:/usr/bin:/bin"),
+            "child must have the fixed, explicit PATH this fix sets, not an inherited one: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("TERM=xterm"),
+            "child must have TERM set explicitly: {:?}",
+            result.stdout
+        );
     }
 
     #[tokio::test]

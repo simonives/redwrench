@@ -101,6 +101,14 @@ impl Config {
                         );
                     }
                 }
+                // (issue #59) Store the trimmed command, not the raw
+                // value. PolicyEngine::evaluate compares commands with
+                // exact string equality against a real, untrimmed argv
+                // command name, so a leading/trailing space here (which
+                // already passed the emptiness check above) would
+                // otherwise load successfully and silently never match
+                // anything.
+                let command = r.command.trim().to_string();
                 Ok(Rule {
                     arg_pattern: r.arg_pattern.map(|p| regex::Regex::new(&p)).transpose()?,
                     effect: match r.effect.as_str() {
@@ -111,8 +119,8 @@ impl Config {
                     description: r
                         .description
                         .clone()
-                        .unwrap_or_else(|| format!("custom rule for '{}'", r.command)),
-                    command: r.command,
+                        .unwrap_or_else(|| format!("custom rule for '{command}'")),
+                    command,
                 })
             })
             .collect::<anyhow::Result<Vec<Rule>>>()?;
@@ -457,5 +465,34 @@ mod tests {
         );
         let config = Config::load(file.path()).unwrap();
         assert_eq!(config.developer_user, None);
+    }
+
+    #[test]
+    fn a_custom_rule_command_with_surrounding_whitespace_is_trimmed_and_actually_matches() {
+        // (issue #59) Config::load previously validated r.command.trim() but
+        // stored the untrimmed value, so " ping" passed validation but never
+        // matched a real "ping" argv at evaluate time.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+bind_address = "127.0.0.1:8443"
+bearer_token = "test-token"
+tier = "safe"
+
+[[custom_rules]]
+command = " ping"
+effect = "deny"
+"#,
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.custom_rules[0].command, "ping");
+        let engine = crate::policy::PolicyEngine::new(config.effective_rules());
+        assert!(matches!(
+            engine.evaluate("ping", &["-c".into(), "1".into(), "127.0.0.1".into()]),
+            crate::policy::Decision::Denied(_)
+        ));
     }
 }

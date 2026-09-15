@@ -141,6 +141,58 @@ fn validate_developer_tier_precondition(
     Ok(Some(identity))
 }
 
+/// (issue #54) `validate_developer_tier_precondition` only checks that
+/// `developer_user` resolves to a non-root uid. It says nothing about
+/// whether that account can `sudo` back to root, which would defeat the
+/// entire tier: any dropped command could trivially re-escalate via
+/// `sudo`, since `sudo` itself is not denied by the policy engine and
+/// would run under the dropped identity's own sudo rights.
+///
+/// Group-based sudoers rules (`%wheel`) are incidentally neutralised
+/// already, `setgroups(&[])` in `executor.rs`'s privilege drop clears all
+/// supplementary groups including `wheel` membership, but that is
+/// incidental protection, not a designed one, and does not cover a
+/// user-named `NOPASSWD` entry (e.g. `developer_user ALL=(ALL) NOPASSWD:
+/// ALL`).
+///
+/// Root can query any user's sudo rights without a password prompt via
+/// `sudo -l -U <username>` (confirmed live: exits 0 either way, the
+/// distinguishing signal is in the output text, not the exit code).
+/// `sudo -l -U <user>` prints "is not allowed to run sudo" when the user
+/// has no sudo rights at all, and something else (naming the permitted
+/// commands) otherwise. This is a warning, not a hard refusal: unlike
+/// `unrestricted` tier or the `custom_rules` unconditional-allow gate,
+/// this is an operator misconfiguration an agent cannot trigger
+/// remotely, not a reachable-by-an-agent bypass, so refusing to start
+/// over it would be a surprising failure mode for an operator who has a
+/// deliberate, unrelated reason to grant that account some sudo rights.
+///
+/// If `sudo` itself is not installed (or otherwise fails to spawn), the
+/// check is skipped silently rather than failing startup over a missing
+/// optional binary, the same "do not add a new failure mode over an
+/// environment gap" posture `audit::init_logging`'s journald fallback
+/// already takes in `run_server`.
+fn warn_on_developer_user_sudo_access(username: &str) {
+    let output = match std::process::Command::new("sudo")
+        .args(["-l", "-U", username])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("is not allowed to run sudo") {
+        eprintln!(
+            "WARNING: developer_user '{username}' has sudo access. Any command \
+             dropped to this account under 'developer' tier can potentially \
+             re-escalate to root via sudo, defeating the tier's privilege-drop \
+             guarantee. Review this account's sudoers configuration if this is \
+             unintentional. ('sudo -l -U {username}' reported: {})",
+            stdout.trim()
+        );
+    }
+}
+
 /// (issue #42) `custom_rules` are prepended ahead of every tier rule
 /// (`Config::effective_rules`), so an unconditional allow
 /// (`arg_pattern: None`) for any command under `safe` or `standard`
@@ -233,6 +285,60 @@ fn validate_custom_rules_precondition(
     Ok(())
 }
 
+/// (issue #58) `Config::effective_rules` prepends `custom_rules` ahead of
+/// every tier rule, correct and deliberate for custom denies, but for a
+/// custom allow it means the tier's own deny for that command becomes
+/// unreachable, first-match-wins, whenever the custom allow's pattern
+/// matches. An operator writing an unconditional custom allow for a
+/// command that also has a tier-level deny is very likely doing this
+/// unintentionally, e.g. "allow ping" reasonably means "let the agent
+/// ping normally", not "reinstate every abuse flag the tier denies".
+///
+/// Detection mirrors #42's "unconditional" check (no `arg_pattern`, or a
+/// catch-all pattern satisfied by the empty string): scan the active
+/// tier's own rule list (`rules_for_tier`) for any `Deny` rule on the
+/// same command. If one exists, the custom allow shadows it. This is a
+/// warning, not a hard refusal (unlike #42's gate): the operator has
+/// explicitly authored this allow, it is a config-review nudge, not a
+/// concealed root-execution primitive.
+fn custom_allow_shadowed_tier_denies(
+    tier: &policy::tiers::TierName,
+    custom_rules: &[policy::Rule],
+) -> Vec<String> {
+    let tier_rules = policy::tiers::rules_for_tier(tier);
+    let mut warnings = Vec::new();
+    for rule in custom_rules {
+        if !matches!(rule.effect, policy::Effect::Allow) {
+            continue;
+        }
+        let is_unconditional = match &rule.arg_pattern {
+            None => true,
+            Some(pattern) => pattern.is_match(""),
+        };
+        if !is_unconditional {
+            continue;
+        }
+        let shadowed: Vec<&str> = tier_rules
+            .iter()
+            .filter(|r| r.command == rule.command && matches!(r.effect, policy::Effect::Deny))
+            .map(|r| r.description.as_str())
+            .collect();
+        if !shadowed.is_empty() {
+            warnings.push(format!(
+                "custom_rules unconditionally allow '{}', which reinstates behaviour \
+                 the '{}' tier otherwise denies for that command: {}. Since \
+                 custom_rules are evaluated before tier rules, this custom allow \
+                 makes those denials unreachable for '{}'.",
+                rule.command,
+                policy::tiers::tier_display_name(tier),
+                shadowed.join("; "),
+                rule.command
+            ));
+        }
+    }
+    warnings
+}
+
 async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
     // NOTE (post-review fix, audit must not fail silently): if journald is
     // unavailable (containers, non-systemd hosts), `audit::init_logging`
@@ -278,8 +384,15 @@ async fn run_server(cli: &cli::Cli) -> anyhow::Result<()> {
         cli.i_understand_the_risk,
     )?;
 
+    for warning in custom_allow_shadowed_tier_denies(&config.tier, &config.custom_rules) {
+        eprintln!("WARNING: {warning}");
+    }
+
     let developer_identity =
         validate_developer_tier_precondition(&config.tier, &config.developer_user)?;
+    if let Some(ref username) = config.developer_user {
+        warn_on_developer_user_sudo_access(username);
+    }
 
     let tier_name = policy::tiers::tier_display_name(&config.tier);
     let server = RedWrenchServer::new(
@@ -652,5 +765,89 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn warn_on_developer_user_sudo_access_does_not_panic_for_a_real_unprivileged_user() {
+        // (issue #54) "nobody" exists on every Fedora system (this project's
+        // documented test environment) and has no sudoers entry by default.
+        // This is a smoke test confirming the function runs to completion
+        // without panicking; the actual warning text goes to stderr, which
+        // Rust's test harness does not capture for inline assertion, so this
+        // test cannot assert on the warning's absence directly, only that
+        // calling the function is safe.
+        warn_on_developer_user_sudo_access("nobody");
+    }
+
+    #[test]
+    fn warn_on_developer_user_sudo_access_does_not_panic_when_sudo_reports_a_nopasswd_entry() {
+        // (issue #54) Creates a real, temporary sudoers.d entry for a
+        // throwaway account, confirms the function runs to completion, then
+        // cleans up. This project's existing tests already require a real
+        // Fedora environment running as root (see `identity_for` in
+        // executor.rs), so creating a real sudoers file here is consistent
+        // with that established practice, not a new requirement.
+        let sudoers_path = "/etc/sudoers.d/redwrench-test-nopasswd";
+        std::fs::write(sudoers_path, "nobody ALL=(ALL) NOPASSWD: ALL\n")
+            .expect("this test requires root, matching this project's other Fedora-only tests");
+        // sudoers.d files must be mode 0440 or sudo ignores them with a
+        // warning rather than an error, which would make this test silently
+        // meaningless rather than fail loudly.
+        std::fs::set_permissions(
+            sudoers_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o440),
+        )
+        .unwrap();
+        warn_on_developer_user_sudo_access("nobody");
+        std::fs::remove_file(sudoers_path).ok();
+    }
+
+    #[test]
+    fn custom_unconditional_ping_allow_at_safe_tier_warns_about_the_shadowed_abuse_flag_deny() {
+        // (issue #58) safe tier has PING_ABUSE_FLAGS denies for "ping". A
+        // custom unconditional allow for "ping" sits ahead of those denies
+        // (custom_rules are prepended, see Config::effective_rules), making
+        // them unreachable for that command.
+        let custom_rules = vec![policy::Rule {
+            command: "ping".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: allow ping".to_string(),
+        }];
+        let warnings =
+            custom_allow_shadowed_tier_denies(&policy::tiers::TierName::Safe, &custom_rules);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ping"));
+    }
+
+    #[test]
+    fn custom_allow_for_a_command_with_no_tier_level_deny_produces_no_warning() {
+        // (issue #58) "ip" has no deny rule at safe tier at all, only an
+        // allow, so there is nothing for a custom allow to shadow.
+        let custom_rules = vec![policy::Rule {
+            command: "ip".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Allow,
+            description: "test: allow ip".to_string(),
+        }];
+        let warnings =
+            custom_allow_shadowed_tier_denies(&policy::tiers::TierName::Safe, &custom_rules);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn custom_deny_does_not_trigger_a_shadowed_tier_deny_warning() {
+        // A custom deny for a command with an existing tier deny is not the
+        // shape issue #58 describes (it reinforces the tier's own posture,
+        // it does not reopen anything), so it must not warn.
+        let custom_rules = vec![policy::Rule {
+            command: "ping".to_string(),
+            arg_pattern: None,
+            effect: policy::Effect::Deny,
+            description: "test: deny ping entirely".to_string(),
+        }];
+        let warnings =
+            custom_allow_shadowed_tier_denies(&policy::tiers::TierName::Safe, &custom_rules);
+        assert!(warnings.is_empty());
     }
 }

@@ -221,6 +221,25 @@ const SYSTEMCTL_TARGET_LIFECYCLE: &str = concat!(
     r"|system-update-cleanup\.service)\b"
 );
 
+/// (issue #71) `rpm-ostree` accepts a `-r`/`--reboot` flag on `install`,
+/// `upgrade`, and `uninstall` that reboots the host immediately once the
+/// transaction completes (confirmed live via `rpm-ostree <subcommand>
+/// --help`; `status` has no such flag). `standard` tier's `rpm-ostree`
+/// allow matches the leading subcommand only and says nothing about the
+/// flags that follow it, so `rpm-ostree upgrade --reboot` is allowed
+/// today with no deny in the way, sidestepping `SYSTEMCTL_TARGET_LIFECYCLE`
+/// entirely since that deny is keyed to the `systemctl` command only.
+///
+/// Live-verified against real `rpm-ostree` on a current Fedora container:
+/// no abbreviation of `--reboot` is accepted (`--reb` is rejected as
+/// "Unknown option"), but clustered short options are accepted (`-rq`
+/// passes option parsing, matching `-r` and `-q` together), and no other
+/// short option under `install`/`upgrade`/`uninstall` begins with `r`, so
+/// a clustered-form-aware pattern cannot collide with any legitimate
+/// flag. Mirrors the deny-before-allow pattern already used for `dnf`
+/// and `systemctl` in this file.
+const RPM_OSTREE_REBOOT_FLAG: &str = r"(?:^|\s)(?:--reboot|-[A-Za-z]*r)";
+
 /// Flags that defeat dnf's integrity and repository trust model:
 /// `--nogpgcheck` skips signature verification, `--repofrompath` adds an
 /// attacker-controlled repository for the duration of the transaction,
@@ -323,8 +342,49 @@ const SYSTEMCTL_TARGET_LIFECYCLE: &str = concat!(
 /// substrings mid-word, or a positional argument that merely contains
 /// the letter `c` without a leading hyphen (e.g. `myconfigtool`,
 /// `gcc-package`), is not denied.
+///
+/// (issue #51) This deny's correctness currently depends on an absence:
+/// `safe_rules()` defines no `dnf` allow at all, so nothing sits ahead of
+/// this deny in evaluation order. If `safe` ever gains a `dnf` allow (a
+/// reasonable future addition, e.g. a read-only `dnf list`), that allow
+/// would sit earlier in the rule list (since `standard_rules()` extends
+/// `safe_rules()`) and would make this deny unreachable, first-match-wins,
+/// for any argument string the new `safe` allow already matched. Check
+/// `dnf_trust_bypass_survives_a_hypothetical_safe_tier_dnf_allow` (in this
+/// file's test module) before adding any `safe`-tier `dnf` rule: it fails
+/// loudly the moment a `safe`-tier allow reopens this gap.
 const DNF_TRUST_BYPASS_FLAGS: &str =
     r"(?:^|\s)(?:--nog|--no-g|--repof|--set|--con|--i|--des|--downloadd|-[A-Za-z0-9]*c)";
+
+/// (issue #48) `dnf install /path/to/local.rpm` matches `standard` tier's
+/// `^(install|remove|upgrade)` allow with no denied flag involved at all,
+/// since there's no flag, just a path where a repository package name is
+/// expected. `dnf`'s `localpkg_gpgcheck` setting controls whether a
+/// locally-supplied RPM file gets signature-checked before its scriptlets
+/// run as root, independently of `gpgcheck` (repository packages).
+///
+/// Live-verified on a current Fedora container (dnf5 5.4.3.0, Fedora's
+/// current default `dnf`): `gpgcheck = 1` but `localpkg_gpgcheck = 0`, so
+/// a local RPM file is installed with no signature check at all today, on
+/// this project's own default deployment target. Independently
+/// re-confirmed on dnf5 5.4.4.0, so this is not version-pinned.
+///
+/// Matches an argument that looks like a filesystem path (starts with
+/// `/`, `./`, or `../`) or a `.rpm` filename (ends in `.rpm`), rather
+/// than an ordinary repository package name, which does not take either
+/// shape. `\S*\.rpm` requires the literal substring `.rpm`, so it does
+/// not false-positive on a package merely containing the letters "rpm"
+/// with no preceding dot (e.g. `rpmlint`), live-verified against real
+/// dnf5 across 18 realistic package-name shapes with no false positive.
+///
+/// One deliberate piece of collateral: dnf also resolves an absolute
+/// path against a repository package's own provides (e.g. `dnf install
+/// /usr/bin/vim` legitimately installs the signed `vim-enhanced` repo
+/// package), and this deny cannot distinguish that from a genuine local
+/// RPM path without stat-ing the filesystem, which the policy engine has
+/// no access to do. Denying that form too is the correct tradeoff: an
+/// operator who needs it can still reach it via `custom_rules`.
+const DNF_LOCAL_PACKAGE_PATH: &str = r"(?:^|\s)(?:\.{0,2}/\S*|\S*\.rpm)(?:\s|$)";
 
 /// journalctl subcommands and flags that write to `/var/log/journal`
 /// rather than read from it. `--setup-keys` generates and writes Forward
@@ -418,23 +478,22 @@ const JOURNALCTL_GLOB_UNIT_FLAGS: &str = r"(?:^|\s)(?:-u\s*|--unit(?:=|\s+))[^\s
 /// unaffected).
 const JOURNALCTL_PLUS_DISJUNCTION: &str = r"(?:^|\s)\+(?:\s|$)";
 
-/// `sar`'s `-o <file>` writes its binary sample data to an arbitrary
-/// path, an arbitrary-file-write primitive wrapped in a monitoring tool
-/// that is otherwise entirely read-only. Denied before the broad allow,
-/// same first-match-wins pattern as the other tier-level hardening in
-/// this file.
-///
-/// The pattern deliberately has no word boundary after `-o`: `sar` accepts
-/// the output path attached to the flag with no separator (`-ofile.dat`),
-/// the same clustered-short-option shape `PING_ABUSE_FLAGS` was hardened
-/// against for forms like `-fc100`. A trailing `\b` would only match the
-/// space-separated form (`-o /tmp/evil.dat`, where the boundary falls on
-/// the space) and miss the attached form entirely, since `o` and the
-/// following filename character are both word characters and no boundary
-/// exists between them. None of sar's other options begin with `o`
-/// (`-u`, `-r`, `-b`, `-d`, `-n`, `-S`, `-q`, `-w`), so matching bare `-o`
-/// regardless of what follows catches both forms without rejecting any
-/// legitimate flag.
+/// `sar`'s `-o` (write raw sample data to an arbitrary path) is denied
+/// unconditionally. `sar`'s own usage text lists `-o [ <filename> ]` as a
+/// standalone bracketed alternative, separate from the activity-letter
+/// group (`-A`, `-B`, `-b`, ..., `-u [ALL]`, ...), and this was live
+/// confirmed on real sysstat 12.7.9: `sar -uo <file> 1 1`, `sar -ou <file>
+/// 1 1`, and `sar -bo <file> 1 1` were all rejected outright by sar's own
+/// parser (usage error, no file created), so `-o` cannot cluster with any
+/// activity letter in either order (issue #46, ranked PLAUSIBLE by an
+/// earlier audit, REFUTED by this live test). Also live-verified: this
+/// version of sar does not accept an attached-form output path (`sar
+/// -oevil.dat 1 1` was rejected the same way as the clustered forms), it
+/// requires a space before the filename (`sar -o evil.dat 1 1`, which
+/// does work). The pattern has no trailing boundary regardless, since it
+/// matches "-o" as a substring preceded by whitespace or string-start no
+/// matter what follows, so it would already catch an attached form too if
+/// a different sysstat version ever accepted one.
 const SAR_FILE_OUTPUT_FLAG: &str = r"(?:^|\s)-o";
 
 /// (issue #39) `top -c` switches to full command-line display. Since
@@ -594,10 +653,20 @@ pub(crate) fn standard_rules() -> Vec<Rule> {
             DNF_TRUST_BYPASS_FLAGS,
             "reject --nogpgcheck/--no-gpgchecks/--repofrompath/--setopt/-c (incl. clustered)/--config/--installroot/--destdir/--downloaddir, including their shortest unambiguous prefixes (bypasses package signature and repository trust, or operates against a different filesystem tree)",
         ),
+        deny(
+            "dnf",
+            DNF_LOCAL_PACKAGE_PATH,
+            "reject a filesystem path or .rpm filename as the package argument (local RPM installs bypass signature verification, since localpkg_gpgcheck defaults to false and is independent of gpgcheck)",
+        ),
         allow(
             "dnf",
             Some("^(install|remove|upgrade)"),
             "install, remove, or upgrade a package via dnf",
+        ),
+        deny(
+            "rpm-ostree",
+            RPM_OSTREE_REBOOT_FLAG,
+            "reject -r/--reboot (incl. clustered), which reboots the host immediately on completion, bypassing the systemctl-specific reboot lockdown",
         ),
         allow(
             "rpm-ostree",
@@ -635,15 +704,34 @@ pub const DEVELOPER_TOOLS: &[&str] = &[
 ];
 
 /// (issue #27) Commands that must keep running as root regardless of the
-/// active tier, even under `developer`. These are exactly the commands
-/// `safe`/`standard` define: `systemctl`, `journalctl`, `ping`, and `ip`
-/// (from `safe_rules()`), plus `vmstat`, `sar`, and `top` (the monitoring
-/// allowances also in `safe_rules()`), plus `dnf` and `rpm-ostree` (added
-/// by `standard_rules()`). Every one of these needs real system privilege
-/// to do anything useful (querying/controlling systemd units, installing
-/// packages, reading protected log sources, opening raw sockets for ICMP),
-/// so dropping privilege for them would just make them fail, not make them
-/// safer.
+/// active tier, even under `developer`.
+///
+/// (issue #52) `vmstat`, `sar`, `top`, and `ping` were removed from this
+/// list after live verification found all four work fine unprivileged on
+/// a default Fedora system: `vmstat`/`sar`/`top` read world-readable
+/// `/proc` and `/var/log/sa` data, and `ping` uses an unprivileged ICMP
+/// socket under Fedora's default `net.ipv4.ping_group_range` (confirmed
+/// `0 2147483647`, permitting every group). Keeping them here was
+/// unnecessary privilege under `developer` tier for no functional gain,
+/// and it specifically made issue #39's `top -c` disclosure worse than it
+/// needed to be, since `top` running as root discloses more than `top`
+/// running unprivileged would (the underlying `/proc/*/cmdline` exposure
+/// is world-readable regardless, so #39's fix stands either way).
+///
+/// The remaining commands are exactly the commands `safe`/`standard`
+/// define: `systemctl` and `journalctl` (from `safe_rules()`), plus `ip`
+/// (also in `safe_rules()`), plus `dnf` and `rpm-ostree` (added by
+/// `standard_rules()`). Every one of these needs real system privilege to
+/// do anything useful (querying/controlling systemd units, installing
+/// packages, reading the journal via supplementary group membership that
+/// gets cleared by the privilege drop's `setgroups(&[])` call, managing
+/// network interfaces, and package installation). Dropping privilege for
+/// them would just make them fail, not make them safer.
+///
+/// `journalctl` stays: `systemd-journal` group membership would suffice
+/// in principle, but the privilege drop's `setgroups(&[])` call clears
+/// all supplementary groups, so the group route is not actually available
+/// even though it otherwise would be.
 ///
 /// `dispatch()`'s privilege-drop decision under `developer` tier is gated
 /// against this list, not against `DEVELOPER_TOOLS`: the original gating
@@ -669,17 +757,7 @@ pub const DEVELOPER_TOOLS: &[&str] = &[
 /// instead of running as root. This fails toward less privilege, not
 /// more, so it is a functionality gap for that one operator
 /// configuration, not a security one.
-pub const ROOT_REQUIRED_TOOLS: &[&str] = &[
-    "systemctl",
-    "journalctl",
-    "ping",
-    "ip",
-    "vmstat",
-    "sar",
-    "top",
-    "dnf",
-    "rpm-ostree",
-];
+pub const ROOT_REQUIRED_TOOLS: &[&str] = &["systemctl", "journalctl", "ip", "dnf", "rpm-ostree"];
 
 fn developer_rules() -> Vec<Rule> {
     let mut rules = standard_rules();
@@ -869,6 +947,49 @@ mod tests {
             ),
             Decision::Allowed
         ));
+    }
+
+    #[test]
+    fn standard_tier_denies_rpm_ostree_reboot_flag_including_clustered_forms() {
+        // (issue #71) Live-verified against real rpm-ostree: -r and --reboot
+        // both pass option parsing on install/upgrade/uninstall, and -r
+        // clusters with other short flags (e.g. -rq for --reboot --quiet).
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["upgrade".to_string(), "--reboot".to_string()],
+            vec!["upgrade".to_string(), "-r".to_string()],
+            vec!["upgrade".to_string(), "-rq".to_string()],
+            vec!["upgrade".to_string(), "-qr".to_string()],
+            vec!["install".to_string(), "-r".to_string(), "htop".to_string()],
+            vec![
+                "uninstall".to_string(),
+                "-r".to_string(),
+                "htop".to_string(),
+            ],
+        ] {
+            assert!(
+                matches!(engine.evaluate("rpm-ostree", &args), Decision::Denied(_)),
+                "rpm-ostree {} should be denied under standard tier",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn standard_tier_still_allows_ordinary_rpm_ostree_operations_without_reboot() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["upgrade".to_string()],
+            vec!["install".to_string(), "htop".to_string()],
+            vec!["status".to_string()],
+            vec!["uninstall".to_string(), "htop".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("rpm-ostree", &args), Decision::Allowed),
+                "rpm-ostree {} should remain allowed under standard tier",
+                args.join(" ")
+            );
+        }
     }
 
     #[test]
@@ -1820,6 +1941,53 @@ mod tests {
     }
 
     #[test]
+    fn standard_tier_denies_dnf_install_of_a_local_rpm_path_or_filename() {
+        // (issue #48) localpkg_gpgcheck defaults to false on both dnf4 and
+        // dnf5 (live-confirmed on dnf5 5.4.3.0, Fedora's current default), so
+        // a local RPM install bypasses signature verification entirely.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["install".to_string(), "/tmp/evil.rpm".to_string()],
+            vec!["install".to_string(), "./evil.rpm".to_string()],
+            vec!["install".to_string(), "../evil.rpm".to_string()],
+            vec!["install".to_string(), "evil.rpm".to_string()],
+            vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "/tmp/evil.rpm".to_string(),
+            ],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &args), Decision::Denied(_)),
+                "dnf {} should be denied under standard tier",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn standard_tier_still_allows_ordinary_dnf_package_names() {
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        for args in [
+            vec!["install".to_string(), "htop".to_string()],
+            vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "python3-flask".to_string(),
+            ],
+            vec!["install".to_string(), "rpmlint".to_string()],
+            vec!["remove".to_string(), "htop".to_string()],
+            vec!["upgrade".to_string()],
+        ] {
+            assert!(
+                matches!(engine.evaluate("dnf", &args), Decision::Allowed),
+                "dnf {} should remain allowed under standard tier",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
     fn safe_tier_denies_journalctl_flags_at_token_start_but_allows_a_value_that_merely_contains_the_substring(
     ) {
         // Same anchoring fix as the dnf constant above, applied to
@@ -1962,6 +2130,32 @@ mod tests {
     }
 
     #[test]
+    fn safe_tier_denies_sar_o_flag_even_when_an_activity_letter_precedes_it_in_argv() {
+        // (issue #46, refuted live) sar's own parser rejects -o clustered
+        // with an activity letter, so this can never legitimately reach the
+        // policy engine as a single clustered token in the first place. This
+        // test guards the policy engine's own behaviour regardless: even a
+        // hypothetical future sysstat version that did accept clustering
+        // would still be denied, since the regex matches "-o" as a substring
+        // with no requirement about what precedes or follows it in the same
+        // joined argument string.
+        let engine = PolicyEngine::new(rules_for_tier(&TierName::Safe));
+        assert!(matches!(
+            engine.evaluate(
+                "sar",
+                &[
+                    "-u".into(),
+                    "-o".into(),
+                    "/tmp/evil.dat".into(),
+                    "1".into(),
+                    "5".into()
+                ]
+            ),
+            Decision::Denied(_)
+        ));
+    }
+
+    #[test]
     fn the_monitoring_allow_rules_are_inherited_by_the_standard_tier() {
         let engine = PolicyEngine::new(rules_for_tier(&TierName::Standard));
         assert!(matches!(
@@ -2043,5 +2237,92 @@ mod tests {
             ),
             Decision::Denied(_)
         ));
+    }
+
+    #[ignore = "issue #51: demonstrates the fragility, not a bug in current shipped rules (safe has no real dnf allow yet); un-ignore and fix (e.g. duplicate the trust-bypass deny into safe_rules() itself, or move it, once a real safe-tier dnf allow is proposed)"]
+    #[test]
+    fn dnf_trust_bypass_survives_a_hypothetical_safe_tier_dnf_allow() {
+        // (issue #51) safe_rules() currently has no "dnf" allow at all, which
+        // is the only reason standard's DNF_TRUST_BYPASS_FLAGS deny is
+        // reachable. This test constructs the scenario issue #51 warns
+        // about directly: an engine built from safe_rules() plus a
+        // hypothetical unconditional "dnf" allow prepended ahead of
+        // standard's own rules (mirroring how a real safe-tier addition
+        // would sit earlier in evaluation order), and asserts the
+        // trust-bypass deny still applies. If this test starts failing, it
+        // means a real safe-tier dnf allow was added without addressing
+        // issue #51's structural fragility, and this deny needs to move (or
+        // be duplicated) ahead of that allow, not just live in standard.
+        let mut rules = vec![super::allow(
+            "dnf",
+            None,
+            "hypothetical future safe-tier dnf allow, for regression testing only",
+        )];
+        rules.extend(standard_rules());
+        let engine = PolicyEngine::new(rules);
+        assert!(
+            matches!(
+                engine.evaluate(
+                    "dnf",
+                    &["install".into(), "--nogpgcheck".into(), "htop".into()]
+                ),
+                Decision::Denied(_)
+            ),
+            "a hypothetical safe-tier dnf allow must not make DNF_TRUST_BYPASS_FLAGS unreachable"
+        );
+    }
+
+    #[test]
+    fn root_required_tools_no_longer_includes_vmstat_sar_top_or_ping() {
+        // (issue #52) Live-verified all four work fine unprivileged on a
+        // default Fedora system; keeping them root-required was unnecessary
+        // privilege under developer tier for no functional gain.
+        for tool in ["vmstat", "sar", "top", "ping"] {
+            assert!(
+                !ROOT_REQUIRED_TOOLS.contains(&tool),
+                "{tool} should no longer be in ROOT_REQUIRED_TOOLS"
+            );
+        }
+        for tool in ["systemctl", "journalctl", "ip", "dnf", "rpm-ostree"] {
+            assert!(
+                ROOT_REQUIRED_TOOLS.contains(&tool),
+                "{tool} must remain in ROOT_REQUIRED_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn run_command_shaped_calls_are_denied_by_tiers_rs_regexes_with_no_separator_injected() {
+        // (issue #75) run_command has no "--" separator injection, unlike
+        // dnf.rs/systemctl.rs/network.rs's dedicated routers. This test
+        // proves the invariant those routers' absence of a run_command-level
+        // guard depends on: tiers.rs's own deny regexes catch a dangerous
+        // flag even with no "--" separator anywhere in argv, for at least
+        // one dnf case and one systemctl case, the exact shape a run_command
+        // call would take. If a future change to either deny regex weakens
+        // it in a way that only the router's "--" injection was catching,
+        // this test fails, since it deliberately omits the separator a
+        // dedicated router would have added.
+        let standard = PolicyEngine::new(rules_for_tier(&TierName::Standard));
+        assert!(
+            matches!(
+                standard.evaluate(
+                    "dnf",
+                    &["install".into(), "--nogpgcheck".into(), "htop".into()]
+                ),
+                Decision::Denied(_)
+            ),
+            "dnf --nogpgcheck must be denied even with no -- separator (run_command shape)"
+        );
+        assert!(
+            matches!(
+                standard.evaluate(
+                    "systemctl",
+                    &["start".into(), "reboot.target".into()]
+                ),
+                Decision::Denied(_)
+            ),
+            "systemctl start reboot.target must be denied even with no -- separator (run_command shape)"
+        );
     }
 }

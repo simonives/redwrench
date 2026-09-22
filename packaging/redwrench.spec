@@ -10,7 +10,7 @@
 %global crate redwrench
 
 Name:           %{crate}
-Version:        1.0.1
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        A security-conscious MCP server for Fedora hardware and OS control
 

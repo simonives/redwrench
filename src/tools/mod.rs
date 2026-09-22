@@ -284,6 +284,17 @@ const ARCHITECTURE: &str = include_str!("../../ARCHITECTURE.md");
 const README_URI: &str = "redwrench://docs/readme";
 const ARCHITECTURE_URI: &str = "redwrench://docs/architecture";
 
+// SEP-2549 (protocol 2026-07-28) requires ttlMs/cacheScope on tools/list,
+// resources/list, and resources/read responses; see #83 and the
+// spec_compliance test module below. Every response this server hands back
+// through these three paths is effectively static for the life of the
+// process: the docs resources are include_str!'d at compile time, and the
+// tool list is fixed by the tier chosen at startup (changing it needs a
+// config edit plus a restart, not something that happens while a client
+// holds a cached response). An hour is a safe "won't go stale mid-session"
+// window without claiming the content can never change at all.
+const RESPONSE_TTL_MS: u64 = 3_600_000;
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RedWrenchServer {
     // NOTE (rmcp API adaptation): the task brief's plan assumed a version of
@@ -320,7 +331,26 @@ impl ServerHandler for RedWrenchServer {
                      and tier model.",
                 )
                 .with_mime_type("text/markdown"),
-        ]))
+        ])
+        .with_ttl_ms(RESPONSE_TTL_MS)
+        .with_cache_scope(rmcp::model::CacheScope::Public))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        // The #[tool_handler] macro would otherwise generate this method
+        // itself from self.tool_router, but its generated version doesn't
+        // set ttlMs/cacheScope (see #83's spec_compliance test), so this
+        // hand-written override adds them on top of the same router-sourced
+        // tool list.
+        Ok(
+            rmcp::model::ListToolsResult::with_all_items(self.tool_router.list_all())
+                .with_ttl_ms(RESPONSE_TTL_MS)
+                .with_cache_scope(rmcp::model::CacheScope::Public),
+        )
     }
 
     async fn read_resource(
@@ -341,7 +371,9 @@ impl ServerHandler for RedWrenchServer {
             }
         };
         Ok(rmcp::model::ReadResourceResponse::Complete(
-            rmcp::model::ReadResourceResult::new(vec![contents]),
+            rmcp::model::ReadResourceResult::new(vec![contents])
+                .with_ttl_ms(RESPONSE_TTL_MS)
+                .with_cache_scope(rmcp::model::CacheScope::Public),
         ))
     }
 }

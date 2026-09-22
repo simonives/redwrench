@@ -284,6 +284,17 @@ const ARCHITECTURE: &str = include_str!("../../ARCHITECTURE.md");
 const README_URI: &str = "redwrench://docs/readme";
 const ARCHITECTURE_URI: &str = "redwrench://docs/architecture";
 
+// SEP-2549 (protocol 2026-07-28) requires ttlMs/cacheScope on tools/list,
+// resources/list, and resources/read responses; see #83 and the
+// spec_compliance test module below. Every response this server hands back
+// through these three paths is effectively static for the life of the
+// process: the docs resources are include_str!'d at compile time, and the
+// tool list is fixed by the tier chosen at startup (changing it needs a
+// config edit plus a restart, not something that happens while a client
+// holds a cached response). An hour is a safe "won't go stale mid-session"
+// window without claiming the content can never change at all.
+const RESPONSE_TTL_MS: u64 = 3_600_000;
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RedWrenchServer {
     // NOTE (rmcp API adaptation): the task brief's plan assumed a version of
@@ -320,7 +331,26 @@ impl ServerHandler for RedWrenchServer {
                      and tier model.",
                 )
                 .with_mime_type("text/markdown"),
-        ]))
+        ])
+        .with_ttl_ms(RESPONSE_TTL_MS)
+        .with_cache_scope(rmcp::model::CacheScope::Public))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        // The #[tool_handler] macro would otherwise generate this method
+        // itself from self.tool_router, but its generated version doesn't
+        // set ttlMs/cacheScope (see #83's spec_compliance test), so this
+        // hand-written override adds them on top of the same router-sourced
+        // tool list.
+        Ok(
+            rmcp::model::ListToolsResult::with_all_items(self.tool_router.list_all())
+                .with_ttl_ms(RESPONSE_TTL_MS)
+                .with_cache_scope(rmcp::model::CacheScope::Public),
+        )
     }
 
     async fn read_resource(
@@ -341,7 +371,9 @@ impl ServerHandler for RedWrenchServer {
             }
         };
         Ok(rmcp::model::ReadResourceResponse::Complete(
-            rmcp::model::ReadResourceResult::new(vec![contents]),
+            rmcp::model::ReadResourceResult::new(vec![contents])
+                .with_ttl_ms(RESPONSE_TTL_MS)
+                .with_cache_scope(rmcp::model::CacheScope::Public),
         ))
     }
 }
@@ -1082,5 +1114,78 @@ pub(crate) mod tests {
             streamed.contains("one") && streamed.contains("two"),
             "streamed chunks did not carry the command's output: {streamed:?}"
         );
+    }
+
+    /// Guards against the class of gap that let issue #83 ship: `rmcp`'s
+    /// response types already model a spec-required field (here, SEP-2549's
+    /// `ttlMs`/`cacheScope`, protocol version 2026-07-28), but our own
+    /// hand-written handler never populated it, so nothing failed at compile
+    /// time (`ttl_ms`/`cache_scope` are `Option`, absent by default) and
+    /// nothing failed in `cargo test` either, only a real client validating
+    /// the actual wire response ever caught it. This module asserts against
+    /// the real serialized JSON (the wire shape), not the Rust struct, since
+    /// a field present on the struct but dropped by a serde attribute would
+    /// pass a struct-level check and still break a real client.
+    ///
+    /// This cannot catch a *future* SEP nobody has written support for yet;
+    /// `REQUIRED_ON_*` only names fields the currently-pinned `rmcp` already
+    /// models as spec-required. Extending support to a new SEP still means
+    /// updating `rmcp`, updating the handler, and adding it here, same as
+    /// this fix did. What this closes is the specific gap where the
+    /// dependency already knows about a requirement and the handler forgot
+    /// to use it.
+    mod spec_compliance {
+        use super::*;
+
+        const REQUIRED_ON_READ_RESOURCE_RESULT: &[&str] = &["ttlMs", "cacheScope"];
+        const REQUIRED_ON_LIST_RESOURCES_RESULT: &[&str] = &["ttlMs", "cacheScope"];
+        const REQUIRED_ON_LIST_TOOLS_RESULT: &[&str] = &["ttlMs", "cacheScope"];
+
+        fn assert_spec_compliant(json: &serde_json::Value, required: &[&str]) {
+            for field in required {
+                assert!(
+                    json.get(field).is_some(),
+                    "missing spec-required field '{field}' (SEP-2549, protocol \
+                     2026-07-28) on the actual wire response: {json}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn read_resource_result_is_spec_compliant() {
+            let server = allow_all_server(Duration::from_secs(5));
+            let (ctx, _guard) = test_request_context(&server);
+            let response = server
+                .read_resource(
+                    rmcp::model::ReadResourceRequestParams::new(super::super::README_URI),
+                    ctx,
+                )
+                .await
+                .unwrap();
+            let result = match response {
+                rmcp::model::ReadResourceResponse::Complete(r) => r,
+                other => panic!("expected a complete response, got {other:?}"),
+            };
+            let json = serde_json::to_value(&result).unwrap();
+            assert_spec_compliant(&json, REQUIRED_ON_READ_RESOURCE_RESULT);
+        }
+
+        #[tokio::test]
+        async fn list_resources_result_is_spec_compliant() {
+            let server = allow_all_server(Duration::from_secs(5));
+            let (ctx, _guard) = test_request_context(&server);
+            let result = server.list_resources(None, ctx).await.unwrap();
+            let json = serde_json::to_value(&result).unwrap();
+            assert_spec_compliant(&json, REQUIRED_ON_LIST_RESOURCES_RESULT);
+        }
+
+        #[tokio::test]
+        async fn list_tools_result_is_spec_compliant() {
+            let server = allow_all_server(Duration::from_secs(5));
+            let (ctx, _guard) = test_request_context(&server);
+            let result = server.list_tools(None, ctx).await.unwrap();
+            let json = serde_json::to_value(&result).unwrap();
+            assert_spec_compliant(&json, REQUIRED_ON_LIST_TOOLS_RESULT);
+        }
     }
 }

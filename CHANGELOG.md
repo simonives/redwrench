@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/) from `1.0.0` onward.
 
+## [1.1.1] - 2026-09-22
+
+A small patch fixing an MCP protocol compliance gap found live-testing `v1.1.0` against Claude Code as a client, filed and fixed same-day (#83, #84).
+
+### Fixed
+
+- **#83**: `read_resource` and `list_resources` never set the SEP-2549 caching-hint fields (`ttlMs`/`cacheScope`) the MCP `2026-07-28` spec requires on `resources/list` and `resources/read` responses. The pinned `rmcp` SDK already modeled these fields and provided builder methods for them; the hand-written resource handlers in `src/tools/mod.rs` just never called them. A real client (Claude Code) rejected the response outright rather than degrading gracefully. While writing the reproduction test, `list_tools` turned out to have the same gap (the `#[tool_handler]`-generated implementation doesn't set these fields either), fixed the same way with a hand-written override.
+- Added `tools::tests::spec_compliance`, a regression suite asserting the real serialized wire JSON of every affected response against a small manifest of currently-known spec-required fields, so a future case of "the dependency already models a requirement the handler forgot to use" fails CI instead of shipping.
+
 ## [1.1.0] - 2026-09-22
 
 The first sub-release of the `v1.1` milestone (`v1.1a`, "security-relevant policy gaps", tracked in `docs/superpowers/specs/2026-09-11-v1.1-scope-design.md`), closing the ten highest-priority issues from that milestone's 32. Findings came from two sources: the remainder of the original tier-charter audit, and an independent agy/Gemini 3.1 Pro (High) cross-model review of the whole repo. Later sub-releases (`v1.1b` onward: correctness/coverage, reliability/packaging, test coverage, new capability, documentation) will ship as their own subsequent versions rather than waiting for the full milestone.

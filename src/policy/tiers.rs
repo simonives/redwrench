@@ -796,7 +796,12 @@ mod tests {
 
     #[test]
     fn no_tier_rule_has_an_empty_description() {
-        for tier in [TierName::Safe, TierName::Standard, TierName::Unrestricted] {
+        for tier in [
+            TierName::Safe,
+            TierName::Standard,
+            TierName::Developer,
+            TierName::Unrestricted,
+        ] {
             for rule in rules_for_tier(&tier) {
                 assert!(
                     !rule.description.trim().is_empty(),

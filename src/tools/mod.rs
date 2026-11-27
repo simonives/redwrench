@@ -298,14 +298,14 @@ const RESPONSE_TTL_MS: u64 = 3_600_000;
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RedWrenchServer {
     // NOTE (rmcp API adaptation): the task brief's plan assumed a version of
-    // `rmcp::model::ServerInfo` (an alias for `InitializeResult`) that could
+    // `rmcp::model::ServerConfig` (an alias for `InitializeResult`) that could
     // be built with `ServerInfo { capabilities: ..., ..Default::default() }`.
     // The pinned rmcp 3.2.0 marks `InitializeResult` `#[non_exhaustive]`, so
     // that struct-update syntax no longer compiles from outside the crate;
     // its own `InitializeResult::new(capabilities)` constructor is the
     // supported route to the same result.
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo::new(
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
